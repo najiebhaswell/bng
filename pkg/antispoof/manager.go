@@ -211,7 +211,8 @@ func (m *Manager) AddBinding(mac net.HardwareAddr, ipv4 net.IP) error {
 	if ipv4 != nil {
 		ip4 := ipv4.To4()
 		if ip4 != nil {
-			binding.IPv4Addr = binary.BigEndian.Uint32(ip4)
+			// In-memory bytes must be network order to compare with ip->saddr
+			binding.IPv4Addr = binary.NativeEndian.Uint32(ip4)
 			binding.IPv4Valid = 1
 		}
 	}
@@ -320,7 +321,7 @@ func (m *Manager) AddAllowedRange(network *net.IPNet) error {
 
 	key := lpmKey{
 		Prefixlen: uint32(ones),
-		IP:        binary.BigEndian.Uint32(ip4),
+		IP:        binary.NativeEndian.Uint32(ip4), // LPM matches on network-order bytes
 	}
 
 	var value uint8 = 1

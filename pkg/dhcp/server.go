@@ -61,6 +61,11 @@ type Server struct {
 	// Enable RADIUS auth (if false, all MACs are accepted)
 	radiusAuthEnabled bool
 
+	// Outer VLAN tag the XDP fast path sees on this server's requests
+	// (0 = untagged). Non-zero when the fast path is attached to the parent
+	// port of the VLAN subinterface this server listens on.
+	fastPathVLAN uint16
+
 	// Circuit-ID collision callback (Issue #90)
 	// Called when a hash collision is detected during circuit-ID map insertion.
 	onCircuitIDCollision func()
@@ -113,6 +118,7 @@ type ServerConfig struct {
 	Interface         string
 	ServerIP          net.IP
 	RADIUSAuthEnabled bool
+	FastPathVLAN      uint16 // Outer VLAN the XDP fast path sees (0 = untagged)
 }
 
 // NewServer creates a new DHCP slow path server
@@ -133,6 +139,7 @@ func NewServer(cfg ServerConfig, loader *ebpf.Loader, poolMgr *PoolManager, logg
 		leases:            make(map[string]*Lease),
 		leasesByCircuitID: make(map[string]*Lease),
 		radiusAuthEnabled: cfg.RADIUSAuthEnabled,
+		fastPathVLAN:      cfg.FastPathVLAN,
 	}, nil
 }
 
@@ -749,7 +756,7 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
 			assignment := &ebpf.PoolAssignment{
 				PoolID:      lease.PoolID,
 				AllocatedIP: ebpf.IPToUint32(lease.IP),
-				VlanID:      pool.VlanID,
+				VlanID:      uint32(s.fastPathVLAN),
 				ClientClass: uint8(pool.ClientClass),
 				LeaseExpiry: uint64(lease.ExpiresAt.Unix()),
 				Flags:       0,
@@ -1062,7 +1069,7 @@ func (s *Server) updateFastPathCache(mac net.HardwareAddr, lease *Lease, pool *P
 	assignment := &ebpf.PoolAssignment{
 		PoolID:      lease.PoolID,
 		AllocatedIP: ebpf.IPToUint32(lease.IP),
-		VlanID:      pool.VlanID,
+		VlanID:      uint32(s.fastPathVLAN),
 		ClientClass: uint8(pool.ClientClass),
 		LeaseExpiry: uint64(lease.ExpiresAt.Unix()),
 		Flags:       0,

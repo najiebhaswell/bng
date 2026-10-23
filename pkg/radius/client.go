@@ -63,6 +63,12 @@ type AuthRequest struct {
 	NASPortType uint32           // NAS port type (Ethernet = 15)
 	CalledID    string           // Called-Station-Id
 	CallingID   string           // Calling-Station-Id
+
+	// CHAP (RFC 1994) credentials, sent instead of Password when
+	// CHAPResponse is set
+	CHAPID        uint8  // Identifier of the CHAP Challenge/Response
+	CHAPChallenge []byte // Challenge value sent to the peer
+	CHAPResponse  []byte // Response value from the peer (16 bytes for MD5)
 }
 
 // AuthResponse holds authentication response data
@@ -165,7 +171,12 @@ func (c *Client) Authenticate(ctx context.Context, req *AuthRequest) (*AuthRespo
 
 	// Standard attributes
 	rfc2865.UserName_SetString(packet, req.Username)
-	if req.Password != "" {
+	if req.CHAPResponse != nil {
+		// RFC 2865 5.3: CHAP-Password is the CHAP Identifier followed by
+		// the response; the challenge goes in CHAP-Challenge
+		rfc2865.CHAPPassword_Set(packet, append([]byte{req.CHAPID}, req.CHAPResponse...))
+		rfc2865.CHAPChallenge_Set(packet, req.CHAPChallenge)
+	} else if req.Password != "" {
 		rfc2865.UserPassword_SetString(packet, req.Password)
 	}
 	rfc2865.NASIdentifier_SetString(packet, c.nasID)

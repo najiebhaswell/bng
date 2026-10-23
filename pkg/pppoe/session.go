@@ -65,6 +65,19 @@ type Session struct {
 	PeerMagic     uint32
 	MRU           uint16
 	PeerMRU       uint16
+	AuthProto     uint16 // Auth-Protocol we request: ProtocolPAP or ProtocolCHAP
+
+	// LCP/CHAP negotiation progress, only touched by the server goroutine
+	lcpConfigNaks int    // Configure-Naks received for our Configure-Request
+	lcpLocalAcked bool   // Peer acked our Configure-Request
+	lcpPeerAcked  bool   // We acked the peer's Configure-Request
+	chapID        uint8  // Identifier of the outstanding CHAP Challenge
+	chapChallenge []byte // Outstanding CHAP Challenge value (nil if none)
+
+	// Restart timer for our outstanding request in the current phase
+	// (LCP/IPCP Configure-Request or CHAP Challenge)
+	negSentAt  time.Time // When it was last sent
+	negRetries int       // Retransmissions in this phase
 
 	// IP configuration
 	ClientIP     net.IP

@@ -1,6 +1,7 @@
 package pppoe
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -12,6 +13,26 @@ import (
 	"github.com/codelaboratoryltd/bng/pkg/radius"
 	"go.uber.org/zap"
 )
+
+// maxLCPConfigNaks bounds how often the peer may Nak our LCP
+// Configure-Request before the session is torn down (RFC 1661 Max-Failure
+// is 5; Max-Configure is 10).
+const maxLCPConfigNaks = 10
+
+// Retransmission of our requests (RFC 1661 Restart timer and Max-Configure):
+// a lost Configure-Request or CHAP Challenge must not leave a session stuck.
+const (
+	restartInterval = 3 * time.Second
+	maxConfigure    = 10
+)
+
+// Dataplane forwards the traffic of established sessions outside userspace
+// (e.g. the XDP PPPoE data plane). Sessions are added once IPCP is up and
+// removed when they end.
+type Dataplane interface {
+	AddSession(session *Session) error
+	RemoveSession(session *Session) error
+}
 
 // rawSocket is an interface for platform-specific raw socket operations
 type rawSocket interface {
@@ -46,8 +67,14 @@ type Server struct {
 	// RADIUS client (optional)
 	radiusClient *radius.Client
 
-	// Raw socket (platform-specific)
-	socket rawSocket
+	// Data plane for established sessions (optional)
+	dataplane Dataplane
+
+	// Raw sockets (platform-specific). An AF_PACKET socket is bound to a
+	// single EtherType, so discovery (0x8863) and session (0x8864) frames
+	// each need their own.
+	socket        rawSocket
+	sessionSocket rawSocket
 
 	// Statistics
 	padiReceived  uint64
@@ -199,6 +226,11 @@ func newServerWithInterface(cfg ServerConfig, logger *zap.Logger, iface *net.Int
 	if authType == "" {
 		authType = "pap"
 	}
+	switch authType {
+	case "pap", "chap", "both":
+	default:
+		return nil, fmt.Errorf("invalid auth type %q (must be pap, chap or both)", authType)
+	}
 
 	mru := cfg.MRU
 	if mru == 0 {
@@ -227,6 +259,12 @@ func (s *Server) SetRADIUSClient(client *radius.Client) {
 	s.radiusClient = client
 }
 
+// SetDataplane sets the data plane that forwards established sessions.
+// Call before Start.
+func (s *Server) SetDataplane(dp Dataplane) {
+	s.dataplane = dp
+}
+
 // Start starts the PPPoE server
 func (s *Server) Start(ctx context.Context) error {
 	s.logger.Info("Starting PPPoE server",
@@ -235,17 +273,23 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("service", s.serviceName),
 	)
 
-	// Create platform-specific socket
+	// Create platform-specific sockets
 	s.socket = newRawSocket()
 	if err := s.socket.open(s.iface, EtherTypePPPoEDiscovery); err != nil {
-		return fmt.Errorf("failed to open socket: %w", err)
+		return fmt.Errorf("failed to open discovery socket: %w", err)
+	}
+	s.sessionSocket = newRawSocket()
+	if err := s.sessionSocket.open(s.iface, EtherTypePPPoESession); err != nil {
+		s.socket.close()
+		return fmt.Errorf("failed to open session socket: %w", err)
 	}
 
-	// Start packet processing
-	go s.receiveLoop(ctx)
-
-	// Start session cleanup
-	go s.cleanupLoop(ctx)
+	// Both sockets feed one processing goroutine, so session state and the
+	// IP pool are only ever touched from a single goroutine
+	frames := make(chan []byte, 256)
+	go s.receiveLoop(ctx, s.socket, frames)
+	go s.receiveLoop(ctx, s.sessionSocket, frames)
+	go s.processLoop(ctx, frames)
 
 	return nil
 }
@@ -253,14 +297,20 @@ func (s *Server) Start(ctx context.Context) error {
 // Stop stops the PPPoE server
 func (s *Server) Stop() error {
 	s.logger.Info("Stopping PPPoE server")
+	var err error
 	if s.socket != nil {
-		return s.socket.close()
+		err = s.socket.close()
 	}
-	return nil
+	if s.sessionSocket != nil {
+		if cerr := s.sessionSocket.close(); err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
 
-// receiveLoop receives and processes PPPoE packets
-func (s *Server) receiveLoop(ctx context.Context) {
+// receiveLoop reads frames from one socket and queues them for processLoop
+func (s *Server) receiveLoop(ctx context.Context, sock rawSocket, frames chan<- []byte) {
 	buf := make([]byte, 1522) // Max Ethernet frame size
 
 	for {
@@ -270,7 +320,7 @@ func (s *Server) receiveLoop(ctx context.Context) {
 		default:
 		}
 
-		n, err := s.socket.recv(buf)
+		n, err := sock.recv(buf)
 		if err != nil {
 			// Timeout or temporary error, continue
 			continue
@@ -280,22 +330,92 @@ func (s *Server) receiveLoop(ctx context.Context) {
 			continue
 		}
 
-		// Parse Ethernet header
-		dstMAC := net.HardwareAddr(buf[0:6])
-		srcMAC := net.HardwareAddr(buf[6:12])
-		etherType := binary.BigEndian.Uint16(buf[12:14])
+		frame := make([]byte, n)
+		copy(frame, buf[:n])
+		select {
+		case frames <- frame:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
 
-		// Check if it's for us (broadcast or our MAC)
-		if !isBroadcastMAC(dstMAC) && dstMAC.String() != s.serverMAC.String() {
+// processLoop handles queued frames from all sockets and expires idle
+// sessions, so session state is only touched from this goroutine
+func (s *Server) processLoop(ctx context.Context, frames <-chan []byte) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	restart := time.NewTicker(time.Second)
+	defer restart.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case frame := <-frames:
+			s.handleFrame(frame)
+		case <-ticker.C:
+			s.cleanupExpired()
+		case now := <-restart.C:
+			s.retransmit(now)
+		}
+	}
+}
+
+// retransmit resends our outstanding request for sessions whose restart
+// timer expired, and gives up on sessions after maxConfigure retries. Only
+// requests we originate are covered; the peer retransmits its own.
+func (s *Server) retransmit(now time.Time) {
+	for _, session := range s.sessions.GetAllSessions() {
+		if now.Sub(session.negSentAt) < restartInterval {
 			continue
 		}
 
-		switch etherType {
-		case EtherTypePPPoEDiscovery:
-			s.handleDiscovery(srcMAC, buf[14:n])
-		case EtherTypePPPoESession:
-			s.handleSession(srcMAC, buf[14:n])
+		var resend func(*Session)
+		switch session.GetState() {
+		case StateLCPNegotiation:
+			if session.lcpLocalAcked {
+				continue
+			}
+			resend = s.startLCPNegotiation
+		case StateAuthentication:
+			// PAP is driven by the peer's Authenticate-Request
+			if session.chapChallenge == nil {
+				continue
+			}
+			resend = s.sendCHAPChallenge
+		case StateIPCPNegotiation:
+			resend = s.sendIPCPConfigRequest
+		default:
+			continue
 		}
+
+		if session.negRetries >= maxConfigure {
+			s.terminateSession(session, "negotiation timed out")
+			continue
+		}
+		session.negRetries++
+		resend(session)
+	}
+}
+
+// handleFrame dispatches one Ethernet frame
+func (s *Server) handleFrame(frame []byte) {
+	// Parse Ethernet header
+	dstMAC := net.HardwareAddr(frame[0:6])
+	srcMAC := net.HardwareAddr(frame[6:12])
+	etherType := binary.BigEndian.Uint16(frame[12:14])
+
+	// Check if it's for us (broadcast or our MAC)
+	if !isBroadcastMAC(dstMAC) && dstMAC.String() != s.serverMAC.String() {
+		return
+	}
+
+	switch etherType {
+	case EtherTypePPPoEDiscovery:
+		s.handleDiscovery(srcMAC, frame[14:])
+	case EtherTypePPPoESession:
+		s.handleSession(srcMAC, frame[14:])
 	}
 }
 
@@ -311,6 +431,10 @@ func (s *Server) handleDiscovery(clientMAC net.HardwareAddr, data []byte) {
 		return
 	}
 
+	if int(hdr.Length) > len(data)-6 {
+		s.logger.Debug("PPPoE length exceeds frame", zap.Uint16("length", hdr.Length))
+		return
+	}
 	payload := data[6 : 6+hdr.Length]
 	tags, err := ParseTags(payload)
 	if err != nil {
@@ -401,6 +525,17 @@ func (s *Server) handlePADR(clientMAC net.HardwareAddr, tags []Tag) {
 		hostUniq = hu.Value
 	}
 
+	// A PADR from a MAC that already has a session means the client never
+	// got our PADS (or restarted): replace the old session instead of
+	// leaving it behind
+	if old := s.sessions.GetSessionByMAC(clientMAC); old != nil {
+		s.logger.Info("Replacing PPPoE session on new PADR",
+			zap.Uint16("session_id", old.ID),
+			zap.String("client_mac", clientMAC.String()),
+		)
+		s.endSession(old)
+	}
+
 	// Create session
 	session, err := s.sessions.CreateSession(clientMAC, s.serverMAC)
 	if err != nil {
@@ -431,20 +566,26 @@ func (s *Server) handlePADR(clientMAC net.HardwareAddr, tags []Tag) {
 
 	// Move to LCP negotiation
 	session.SetState(StateLCPNegotiation)
+	session.AuthProto = ProtocolPAP
+	if s.authType == "chap" {
+		session.AuthProto = ProtocolCHAP
+	}
 
 	s.logger.Info("PPPoE session created",
 		zap.Uint16("session_id", session.ID),
 		zap.String("client_mac", clientMAC.String()),
 	)
 
-	// Start LCP negotiation
-	go s.startLCPNegotiation(session)
+	// Start LCP negotiation (synchronously: session state is only touched
+	// from the processing goroutine)
+	s.startLCPNegotiation(session)
 }
 
 // handlePADT handles PPPoE Active Discovery Terminate
 func (s *Server) handlePADT(clientMAC net.HardwareAddr, sessionID uint16) {
 	session := s.sessions.GetSession(sessionID)
-	if session == nil {
+	// Only the session's own client may tear it down
+	if session == nil || !bytes.Equal(session.ClientMAC, clientMAC) {
 		return
 	}
 
@@ -453,13 +594,7 @@ func (s *Server) handlePADT(clientMAC net.HardwareAddr, sessionID uint16) {
 		zap.String("client_mac", clientMAC.String()),
 	)
 
-	// Release IP
-	if s.clientIPPool != nil {
-		s.clientIPPool.Release(session.SessionID)
-	}
-
-	// Remove session
-	s.sessions.RemoveSession(sessionID)
+	s.endSession(session)
 }
 
 // handleSession handles PPPoE session packets (PPP)
@@ -470,6 +605,10 @@ func (s *Server) handleSession(clientMAC net.HardwareAddr, data []byte) {
 
 	hdr, err := ParsePPPoEHeader(data)
 	if err != nil {
+		return
+	}
+	// Length covers the 2-byte PPP protocol field and the payload
+	if hdr.Length < 2 || int(hdr.Length) > len(data)-6 {
 		return
 	}
 
@@ -490,6 +629,8 @@ func (s *Server) handleSession(clientMAC net.HardwareAddr, data []byte) {
 		s.handleLCP(session, pppPayload)
 	case ProtocolPAP:
 		s.handlePAP(session, pppPayload)
+	case ProtocolCHAP:
+		s.handleCHAP(session, pppPayload)
 	case ProtocolIPCP:
 		s.handleIPCP(session, pppPayload)
 	case ProtocolIP:
@@ -499,14 +640,16 @@ func (s *Server) handleSession(clientMAC net.HardwareAddr, data []byte) {
 
 // startLCPNegotiation initiates LCP negotiation
 func (s *Server) startLCPNegotiation(session *Session) {
+	session.negSentAt = time.Now()
+
 	// Encode MRU as big-endian uint16
 	mruBytes := []byte{byte(s.mru >> 8), byte(s.mru)}
 
-	// Determine auth protocol from config
+	// Auth protocol for this session (config default, or what the peer Nak'ed)
 	var authProtoData []byte
-	switch s.authType {
-	case "chap":
-		authProtoData = []byte{0xC2, 0x23, 0x05} // CHAP with MD5
+	switch session.AuthProto {
+	case ProtocolCHAP:
+		authProtoData = []byte{0xC2, 0x23, CHAPAlgorithmMD5} // CHAP with MD5
 	default:
 		authProtoData = []byte{0xC0, 0x23} // PAP
 	}
@@ -541,6 +684,8 @@ func (s *Server) handleLCP(session *Session, data []byte) {
 		s.handleLCPConfigAck(session, pkt)
 	case LCPCodeConfigNak:
 		s.handleLCPConfigNak(session, pkt)
+	case LCPCodeConfigReject:
+		s.handleLCPConfigReject(session, pkt)
 	case LCPCodeEchoRequest:
 		s.handleLCPEchoRequest(session, pkt)
 	case LCPCodeTermRequest:
@@ -584,6 +729,11 @@ func (s *Server) handleLCPConfigRequest(session *Session, pkt *LCPPacket) {
 	}
 
 	s.sendPPPPacket(session, ProtocolLCP, resp.Serialize())
+
+	if accepted {
+		session.lcpPeerAcked = true
+		s.maybeStartAuth(session)
+	}
 }
 
 // handleLCPConfigAck handles LCP Configure-Ack
@@ -592,14 +742,116 @@ func (s *Server) handleLCPConfigAck(session *Session, pkt *LCPPacket) {
 		zap.Uint16("session_id", session.ID),
 	)
 
-	// Move to authentication phase
-	session.SetState(StateAuthentication)
+	session.lcpLocalAcked = true
+	s.maybeStartAuth(session)
 }
 
-// handleLCPConfigNak handles LCP Configure-Nak
+// maybeStartAuth moves to the authentication phase once LCP is open in both
+// directions; for CHAP the authenticator then sends the first Challenge.
+func (s *Server) maybeStartAuth(session *Session) {
+	if !session.lcpLocalAcked || !session.lcpPeerAcked || session.GetState() != StateLCPNegotiation {
+		return
+	}
+	session.SetState(StateAuthentication)
+	session.negRetries = 0
+	if session.AuthProto == ProtocolCHAP {
+		s.sendCHAPChallenge(session)
+	}
+}
+
+// handleLCPConfigNak handles LCP Configure-Nak by adopting the peer's
+// suggested auth protocol if our config allows it. Without a usable
+// suggestion, resending the same request would loop forever, so the number
+// of Naks is bounded and an unacceptable auth protocol ends the session.
 func (s *Server) handleLCPConfigNak(session *Session, pkt *LCPPacket) {
-	// Re-send with suggested values
+	session.lcpConfigNaks++
+	if session.lcpConfigNaks > maxLCPConfigNaks {
+		s.terminateSession(session, "LCP negotiation did not converge")
+		return
+	}
+
+	opts, err := ParseLCPOptions(pkt.Data)
+	if err != nil {
+		return
+	}
+	for _, opt := range opts {
+		if opt.Type != LCPOptAuthProto || len(opt.Data) < 2 {
+			continue
+		}
+		proto := binary.BigEndian.Uint16(opt.Data)
+		if !s.authProtoAllowed(proto, opt.Data[2:]) {
+			s.logger.Warn("Peer requires an auth protocol that is not enabled",
+				zap.Uint16("session_id", session.ID),
+				zap.String("requested", fmt.Sprintf("0x%x", opt.Data)),
+				zap.String("auth_type", s.authType),
+			)
+			s.terminateSession(session, "no common auth protocol")
+			return
+		}
+		session.AuthProto = proto
+	}
+
 	s.startLCPNegotiation(session)
+}
+
+// handleLCPConfigReject handles LCP Configure-Reject. Every option we send
+// (MRU, Magic-Number, Auth-Protocol) is one we cannot drop safely, in
+// particular authentication, so the session is ended.
+func (s *Server) handleLCPConfigReject(session *Session, pkt *LCPPacket) {
+	s.terminateSession(session, "peer rejected LCP options")
+}
+
+// authProtoAllowed reports whether an Auth-Protocol suggested by the peer
+// (protocol plus its data, e.g. the CHAP algorithm) is enabled by config.
+func (s *Server) authProtoAllowed(proto uint16, data []byte) bool {
+	switch proto {
+	case ProtocolPAP:
+		return s.authType == "pap" || s.authType == "both"
+	case ProtocolCHAP:
+		return (s.authType == "chap" || s.authType == "both") &&
+			len(data) >= 1 && data[0] == CHAPAlgorithmMD5
+	}
+	return false
+}
+
+// terminateSession ends a session from the server side: LCP
+// Terminate-Request, then PADT, then the session and its IP are released.
+func (s *Server) terminateSession(session *Session, reason string) {
+	s.logger.Info("Terminating PPPoE session",
+		zap.Uint16("session_id", session.ID),
+		zap.String("client_mac", session.ClientMAC.String()),
+		zap.String("reason", reason),
+	)
+
+	term := &LCPPacket{
+		Code:       LCPCodeTermRequest,
+		Identifier: session.NextLCPIdentifier(),
+		Data:       []byte(reason),
+	}
+	s.sendPPPPacket(session, ProtocolLCP, term.Serialize())
+
+	s.sendDiscoveryPacket(session.ClientMAC, CodePADT, session.ID, nil)
+	atomic.AddUint64(&s.padtSent, 1)
+
+	s.endSession(session)
+}
+
+// endSession releases everything a session holds: its data plane entries,
+// its IP address and the session itself
+func (s *Server) endSession(session *Session) {
+	if s.dataplane != nil && session.IsEstablished() {
+		if err := s.dataplane.RemoveSession(session); err != nil {
+			s.logger.Warn("Failed to remove PPPoE session from data plane",
+				zap.Uint16("session_id", session.ID),
+				zap.Error(err),
+			)
+		}
+	}
+	session.SetState(StateClosed)
+	if s.clientIPPool != nil {
+		s.clientIPPool.Release(session.SessionID)
+	}
+	s.sessions.RemoveSession(session.ID)
 }
 
 // handleLCPEchoRequest handles LCP Echo-Request
@@ -622,8 +874,7 @@ func (s *Server) handleLCPTermRequest(session *Session, pkt *LCPPacket) {
 	s.sendPPPPacket(session, ProtocolLCP, resp.Serialize())
 
 	// Terminate session
-	session.SetState(StateClosed)
-	s.sessions.RemoveSession(session.ID)
+	s.endSession(session)
 }
 
 // handlePAP handles PAP authentication packets
@@ -735,6 +986,133 @@ func (s *Server) handlePAP(session *Session, data []byte) {
 	}
 }
 
+// sendCHAPChallenge sends a CHAP Challenge (RFC 1994) for the session
+func (s *Server) sendCHAPChallenge(session *Session) {
+	challenge := make([]byte, 16)
+	if _, err := rand.Read(challenge); err != nil {
+		s.logger.Error("Failed to generate CHAP challenge",
+			zap.Uint16("session_id", session.ID),
+			zap.Error(err),
+		)
+		return
+	}
+	session.chapID++
+	session.chapChallenge = challenge
+	session.negSentAt = time.Now()
+
+	// Code (1) + Identifier (1) + Length (2) + Value-Size (1) + Value + Name
+	name := []byte(s.acName)
+	data := make([]byte, 5+len(challenge)+len(name))
+	data[0] = CHAPCodeChallenge
+	data[1] = session.chapID
+	binary.BigEndian.PutUint16(data[2:4], uint16(len(data)))
+	data[4] = byte(len(challenge))
+	copy(data[5:], challenge)
+	copy(data[5+len(challenge):], name)
+
+	s.sendPPPPacket(session, ProtocolCHAP, data)
+}
+
+// handleCHAP handles a CHAP Response to our Challenge
+func (s *Server) handleCHAP(session *Session, data []byte) {
+	if len(data) < 5 || data[0] != CHAPCodeResponse {
+		return
+	}
+	identifier := data[1]
+	if session.chapChallenge == nil || identifier != session.chapID {
+		s.logger.Debug("Unexpected CHAP response",
+			zap.Uint16("session_id", session.ID),
+			zap.Uint8("identifier", identifier),
+		)
+		return
+	}
+	length := int(binary.BigEndian.Uint16(data[2:4]))
+	if length < 5 || length > len(data) {
+		return
+	}
+	data = data[:length]
+
+	// MD5 responses are 16 bytes; the rest of the packet is the name
+	valueSize := int(data[4])
+	if valueSize != 16 || len(data) < 5+valueSize {
+		return
+	}
+	response := data[5 : 5+valueSize]
+	username := string(data[5+valueSize:])
+	challenge := session.chapChallenge
+	session.chapChallenge = nil // one Response per Challenge
+
+	s.logger.Debug("CHAP authentication attempt",
+		zap.Uint16("session_id", session.ID),
+		zap.String("username", username),
+	)
+
+	// Authenticate (via RADIUS if configured)
+	var authenticated bool
+	var authResp *radius.AuthResponse
+
+	if s.radiusClient != nil {
+		var err error
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		authResp, err = s.radiusClient.Authenticate(ctx, &radius.AuthRequest{
+			Username:      username,
+			MAC:           session.ClientMAC,
+			CHAPID:        identifier,
+			CHAPChallenge: challenge,
+			CHAPResponse:  response,
+		})
+		authenticated = err == nil && authResp != nil && authResp.Accepted
+	} else {
+		// Accept all if no RADIUS
+		authenticated = true
+	}
+
+	session.Username = username
+	session.Authenticated = authenticated
+	session.AuthMethod = "CHAP"
+
+	// Send response: Code, Identifier, Length, Message
+	var respCode uint8
+	var msg string
+	if authenticated {
+		respCode = CHAPCodeSuccess
+		msg = "Login OK"
+		s.logger.Info("CHAP authentication successful",
+			zap.Uint16("session_id", session.ID),
+			zap.String("username", username),
+		)
+	} else {
+		respCode = CHAPCodeFailure
+		msg = "Login incorrect"
+		s.logger.Warn("CHAP authentication failed",
+			zap.Uint16("session_id", session.ID),
+			zap.String("username", username),
+		)
+	}
+
+	respData := make([]byte, 4+len(msg))
+	respData[0] = respCode
+	respData[1] = identifier
+	binary.BigEndian.PutUint16(respData[2:4], uint16(4+len(msg)))
+	copy(respData[4:], msg)
+
+	s.sendPPPPacket(session, ProtocolCHAP, respData)
+
+	if authenticated {
+		// Store RADIUS class if present
+		if authResp != nil {
+			session.Class = authResp.Class
+		}
+		// Move to IPCP
+		session.SetState(StateIPCPNegotiation)
+		s.startIPCPNegotiation(session)
+	} else {
+		// Terminate
+		session.SetState(StateClosed)
+	}
+}
+
 // startIPCPNegotiation initiates IPCP negotiation
 func (s *Server) startIPCPNegotiation(session *Session) {
 	// Allocate IP for client
@@ -747,10 +1125,18 @@ func (s *Server) startIPCPNegotiation(session *Session) {
 		s.logger.Error("Failed to allocate IP for session",
 			zap.Uint16("session_id", session.ID),
 		)
+		s.terminateSession(session, "no IP address available")
 		return
 	}
 
-	// Send IPCP Configure-Request
+	session.negRetries = 0
+	s.sendIPCPConfigRequest(session)
+}
+
+// sendIPCPConfigRequest sends our IPCP Configure-Request
+func (s *Server) sendIPCPConfigRequest(session *Session) {
+	session.negSentAt = time.Now()
+
 	opts := []LCPOption{
 		{Type: IPCPOptIPAddress, Data: session.ServerIP.To4()},
 	}
@@ -790,33 +1176,29 @@ func (s *Server) handleIPCPConfigRequest(session *Session, pkt *LCPPacket) {
 	var respOpts []LCPOption
 	nakOptions := false
 
+	// NAK an option only when the client asks for something other than what
+	// we assign; once it repeats our values back the request must be ACKed,
+	// or the negotiation never completes
+	nakIfDifferent := func(opt LCPOption, want net.IP) {
+		if want == nil {
+			return
+		}
+		want = want.To4()
+		if !bytes.Equal(opt.Data, want) {
+			respOpts = append(respOpts, LCPOption{Type: opt.Type, Data: want})
+			nakOptions = true
+		}
+	}
+
 	for _, opt := range opts {
 		switch opt.Type {
 		case IPCPOptIPAddress:
 			// Client requesting IP - give them the allocated one
-			if session.ClientIP != nil {
-				respOpts = append(respOpts, LCPOption{
-					Type: IPCPOptIPAddress,
-					Data: session.ClientIP.To4(),
-				})
-				nakOptions = true
-			}
+			nakIfDifferent(opt, session.ClientIP)
 		case IPCPOptPrimaryDNS:
-			if s.primaryDNS != nil {
-				respOpts = append(respOpts, LCPOption{
-					Type: IPCPOptPrimaryDNS,
-					Data: s.primaryDNS.To4(),
-				})
-				nakOptions = true
-			}
+			nakIfDifferent(opt, s.primaryDNS)
 		case IPCPOptSecondaryDNS:
-			if s.secondaryDNS != nil {
-				respOpts = append(respOpts, LCPOption{
-					Type: IPCPOptSecondaryDNS,
-					Data: s.secondaryDNS.To4(),
-				})
-				nakOptions = true
-			}
+			nakIfDifferent(opt, s.secondaryDNS)
 		}
 	}
 
@@ -848,6 +1230,15 @@ func (s *Server) handleIPCPConfigAck(session *Session, pkt *LCPPacket) {
 		zap.String("username", session.Username),
 		zap.String("client_ip", session.ClientIP.String()),
 	)
+
+	if s.dataplane != nil {
+		if err := s.dataplane.AddSession(session); err != nil {
+			s.logger.Error("Failed to add PPPoE session to data plane",
+				zap.Uint16("session_id", session.ID),
+				zap.Error(err),
+			)
+		}
+	}
 }
 
 // handleIPPacket handles encapsulated IP packets
@@ -897,30 +1288,25 @@ func (s *Server) sendPPPPacket(session *Session, protocol uint16, data []byte) {
 	frame := append(hdr.Serialize(), payload...)
 	ethFrame := BuildEthernetFrame(session.ClientMAC, s.serverMAC, EtherTypePPPoESession, frame)
 
-	s.socket.send(s.iface, session.ClientMAC, EtherTypePPPoESession, ethFrame)
+	s.sessionSocket.send(s.iface, session.ClientMAC, EtherTypePPPoESession, ethFrame)
 	session.AddBytesOut(uint64(len(ethFrame)))
 }
 
-// cleanupLoop periodically cleans up expired sessions
-func (s *Server) cleanupLoop(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			timeout := s.sessionTimeout
-			if timeout == 0 {
-				timeout = 5 * time.Minute
-			}
-			removed := s.sessions.CleanupExpired(timeout)
-			if removed > 0 {
-				s.logger.Info("Cleaned up expired PPPoE sessions",
-					zap.Int("count", removed),
-				)
-			}
+// cleanupExpired terminates sessions that have been idle for longer than
+// the session timeout. Data plane traffic bypasses userspace, so activity
+// here means control traffic such as LCP Echo keepalives.
+func (s *Server) cleanupExpired() {
+	timeout := s.sessionTimeout
+	if timeout == 0 {
+		timeout = 5 * time.Minute
+	}
+	now := time.Now()
+	for _, session := range s.sessions.GetAllSessions() {
+		session.mu.RLock()
+		inactive := now.Sub(session.LastActivity) > timeout
+		session.mu.RUnlock()
+		if inactive {
+			s.terminateSession(session, "idle timeout")
 		}
 	}
 }

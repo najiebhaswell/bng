@@ -2,6 +2,7 @@ package qos
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -319,8 +320,9 @@ func (m *Manager) GetSubscriberCount() int {
 	return len(m.subscribers)
 }
 
-// ipToKey converts an IPv4 address to a uint32 key (network byte order)
+// ipToKey converts an IPv4 address to a uint32 key whose in-memory bytes are
+// in network byte order, matching the ip->saddr/daddr the eBPF program looks up.
 func ipToKey(ip net.IP) uint32 {
 	ip4 := ip.To4()
-	return uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3])
+	return binary.NativeEndian.Uint32(ip4)
 }

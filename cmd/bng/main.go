@@ -29,6 +29,7 @@ import (
 	"github.com/codelaboratoryltd/bng/pkg/slaac"
 	"github.com/codelaboratoryltd/bng/pkg/walledgarden"
 	"github.com/spf13/cobra"
+	"github.com/vishvananda/netlink"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
@@ -66,6 +67,8 @@ var (
 	configFile  string
 	logLevel    string
 	bpfPath     string
+	xdpMode     string
+	xdpIface    string
 	serverIP    string
 	metricsAddr string
 	poolNetwork string
@@ -176,6 +179,8 @@ var (
 	pppoeAuthType       string        // Authentication type: pap, chap, or both
 	pppoeSessionTimeout time.Duration // Session idle timeout
 	pppoeMRU            uint16        // Maximum Receive Unit
+	pppoeXDPUplinks     string        // Uplinks for the PPPoE XDP data plane (enables it)
+	pppoeBPFPath        string        // Path to the PPPoE data plane eBPF object
 
 	// BGP configuration (Issue #48)
 	bgpEnabled    bool   // Enable BGP controller
@@ -201,6 +206,10 @@ func init() {
 		"Log level (debug, info, warn, error)")
 	runCmd.Flags().StringVar(&bpfPath, "bpf-path", "bpf/dhcp_fastpath.bpf.o",
 		"Path to compiled eBPF program")
+	runCmd.Flags().StringVar(&xdpMode, "xdp-mode", "generic",
+		"XDP attach mode: generic (any driver), native (driver support, falls back to generic) or offload")
+	runCmd.Flags().StringVar(&xdpIface, "xdp-interface", "",
+		"Interface for the XDP fast path (default: --interface). Set to the physical port when --interface is a VLAN subinterface of it, so the fast path can run in native mode")
 	runCmd.Flags().StringVar(&serverIP, "server-ip", "",
 		"DHCP server IP address (defaults to interface IP)")
 	runCmd.Flags().StringVar(&metricsAddr, "metrics-addr", ":9090",
@@ -395,6 +404,10 @@ func init() {
 		"Session idle timeout")
 	runCmd.Flags().Uint16Var(&pppoeMRU, "pppoe-mru", 1492,
 		"Maximum Receive Unit")
+	runCmd.Flags().StringVar(&pppoeXDPUplinks, "pppoe-xdp-uplinks", "",
+		"Uplink interfaces (comma-separated) for the PPPoE XDP data plane; when set, established PPPoE sessions are forwarded in XDP")
+	runCmd.Flags().StringVar(&pppoeBPFPath, "pppoe-bpf-path", "bpf/pppoe_dataplane.bpf.o",
+		"Path to compiled PPPoE data plane eBPF program")
 
 	// BGP flags (Issue #48)
 	runCmd.Flags().BoolVar(&bgpEnabled, "bgp-enabled", false,
@@ -493,9 +506,32 @@ func runBNG(cmd *cobra.Command, args []string) error {
 	logger.Info("Using server IP", zap.String("ip", srvIP.String()))
 
 	// Load eBPF program
-	logger.Info("Loading eBPF program", zap.String("path", bpfPath))
+	logger.Info("Loading eBPF program", zap.String("path", bpfPath), zap.String("xdp_mode", xdpMode))
 
-	loader, err := ebpf.NewLoader(iface, logger, ebpf.WithBPFPath(bpfPath))
+	xdpFlags, err := ebpf.ParseXDPMode(xdpMode)
+	if err != nil {
+		return fmt.Errorf("invalid --xdp-mode: %w", err)
+	}
+
+	// The fast path may sit on the physical port while the slow path listens
+	// on a VLAN subinterface of it. The XDP program then sees the VLAN tag,
+	// so leases record that VLAN and the fast path only answers on it.
+	fastPathIface := iface
+	var fastPathVLAN uint16
+	if xdpIface != "" && xdpIface != iface {
+		fastPathVLAN, err = vlanOnParent(iface, xdpIface)
+		if err != nil {
+			return fmt.Errorf("invalid --xdp-interface: %w", err)
+		}
+		fastPathIface = xdpIface
+		logger.Info("XDP fast path on parent port",
+			zap.String("xdp_interface", fastPathIface),
+			zap.String("dhcp_interface", iface),
+			zap.Uint16("vlan", fastPathVLAN),
+		)
+	}
+
+	loader, err := ebpf.NewLoader(fastPathIface, logger, ebpf.WithBPFPath(bpfPath), ebpf.WithXDPMode(xdpFlags))
 	if err != nil {
 		return fmt.Errorf("failed to create eBPF loader: %w", err)
 	}
@@ -643,6 +679,7 @@ func runBNG(cmd *cobra.Command, args []string) error {
 		Interface:         iface,
 		ServerIP:          srvIP,
 		RADIUSAuthEnabled: radiusEnabled,
+		FastPathVLAN:      fastPathVLAN,
 	}, loader, poolMgr, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create DHCP server: %w", err)
@@ -1095,6 +1132,24 @@ func runBNG(cmd *cobra.Command, args []string) error {
 		} else {
 			if radiusClient != nil {
 				pppoeServer.SetRADIUSClient(radiusClient)
+			}
+			if pppoeXDPUplinks != "" {
+				dp, err := setupPPPoEDataplane(loader, pppoeIface, iface, fastPathIface, fastPathVLAN, logger)
+				if err != nil {
+					return fmt.Errorf("failed to set up PPPoE XDP data plane: %w", err)
+				}
+				defer func() {
+					if stats, err := dp.dp.Stats(); err == nil {
+						logger.Info("PPPoE XDP data plane statistics", zap.Any("stats", stats))
+					}
+					if err := loader.SetPPPoEProgram(nil); err != nil {
+						logger.Warn("Failed to remove PPPoE upstream program", zap.Error(err))
+					}
+					if err := dp.dp.Close(); err != nil {
+						logger.Warn("Failed to close PPPoE XDP data plane", zap.Error(err))
+					}
+				}()
+				pppoeServer.SetDataplane(dp)
 			}
 			logger.Info("PPPoE server configured",
 				zap.String("interface", pppoeIface),
@@ -1589,6 +1644,113 @@ func resolveSecret(direct, filePath, directFlag, fileFlag string, logger *zap.Lo
 		)
 	}
 	return direct
+}
+
+// vlanOnParent returns the VLAN ID of subif, which must be a VLAN
+// subinterface of parent.
+func vlanOnParent(subif, parent string) (uint16, error) {
+	link, err := netlink.LinkByName(subif)
+	if err != nil {
+		return 0, fmt.Errorf("lookup %s: %w", subif, err)
+	}
+	vlan, ok := link.(*netlink.Vlan)
+	if !ok {
+		return 0, fmt.Errorf("%s is not a VLAN subinterface", subif)
+	}
+	p, err := netlink.LinkByIndex(vlan.Attrs().ParentIndex)
+	if err != nil {
+		return 0, fmt.Errorf("lookup parent of %s: %w", subif, err)
+	}
+	if p.Attrs().Name != parent {
+		return 0, fmt.Errorf("%s is a VLAN on %s, not on %s", subif, p.Attrs().Name, parent)
+	}
+	return uint16(vlan.VlanId), nil
+}
+
+// pppoeXDPDataplane adapts the XDP PPPoE data plane to pppoe.Dataplane
+type pppoeXDPDataplane struct {
+	dp         *ebpf.PPPoEDataplane
+	vlan       uint16 // VLAN tag the XDP program sees on PPPoE frames
+	fibIfindex int    // PPPoE interface, used for route lookups
+	txIfindex  int    // Port the XDP fast path runs on
+}
+
+func (a *pppoeXDPDataplane) entry(s *pppoe.Session) ebpf.PPPoESession {
+	// RFC 2516: the PPP MRU over PPPoE is at most 1492
+	mru := s.PeerMRU
+	if mru == 0 || mru > 1492 {
+		mru = 1492
+	}
+	return ebpf.PPPoESession{
+		SessionID:  s.ID,
+		ClientMAC:  s.ClientMAC,
+		ServerMAC:  s.ServerMAC,
+		ClientIP:   s.ClientIP,
+		VLANID:     a.vlan,
+		MRU:        mru,
+		FIBIfindex: a.fibIfindex,
+		TXIfindex:  a.txIfindex,
+	}
+}
+
+func (a *pppoeXDPDataplane) AddSession(s *pppoe.Session) error {
+	return a.dp.AddSession(a.entry(s))
+}
+
+func (a *pppoeXDPDataplane) RemoveSession(s *pppoe.Session) error {
+	return a.dp.RemoveSession(a.entry(s))
+}
+
+// setupPPPoEDataplane loads the PPPoE XDP data plane, hooks its upstream
+// program into the DHCP fast path on the access port and attaches the
+// downstream program to the uplinks.
+func setupPPPoEDataplane(loader *ebpf.Loader, pppoeIface, dhcpIface, fastPathIface string,
+	fastPathVLAN uint16, logger *zap.Logger) (*pppoeXDPDataplane, error) {
+	// PPPoE frames must arrive where the XDP fast path runs
+	if pppoeIface != dhcpIface {
+		return nil, fmt.Errorf("--pppoe-interface %s must match --interface %s", pppoeIface, dhcpIface)
+	}
+	// XDP forwarding bypasses the TC hooks NAT44 and QoS rely on
+	if natEnabled || qosEnabled {
+		return nil, fmt.Errorf("cannot be combined with --nat-enabled or --qos-enabled")
+	}
+
+	pppoeLink, err := net.InterfaceByName(pppoeIface)
+	if err != nil {
+		return nil, err
+	}
+	accessLink, err := net.InterfaceByName(fastPathIface)
+	if err != nil {
+		return nil, err
+	}
+
+	dp, err := ebpf.NewPPPoEDataplane(pppoeBPFPath, logger)
+	if err != nil {
+		return nil, err
+	}
+	accessMode := loader.AttachedXDPMode()
+	for _, uplink := range splitAndTrim(pppoeXDPUplinks) {
+		if err := dp.AttachUplink(uplink, accessMode, accessMode); err != nil {
+			dp.Close()
+			return nil, err
+		}
+	}
+	if err := loader.SetPPPoEProgram(dp.UpstreamProgram()); err != nil {
+		dp.Close()
+		return nil, err
+	}
+
+	logger.Info("PPPoE XDP data plane enabled",
+		zap.String("access_interface", fastPathIface),
+		zap.Uint16("vlan", fastPathVLAN),
+		zap.String("uplinks", pppoeXDPUplinks),
+	)
+	return &pppoeXDPDataplane{
+		dp:         dp,
+		vlan:       fastPathVLAN,
+		fibIfindex: pppoeLink.Index,
+		txIfindex:  accessLink.Index,
+	}, nil
 }
 
 // parseBGPNeighborEntry parses a "ip:as" string into IP and AS number.

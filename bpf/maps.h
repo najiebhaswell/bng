@@ -89,7 +89,9 @@ struct subscriber_key {
 struct pool_assignment {
 	__u32 pool_id;          /* Which IP pool */
 	__u32 allocated_ip;     /* Currently assigned IP (network byte order) */
-	__u32 vlan_id;          /* VLAN tag for subscriber (deprecated, use s_tag/c_tag) */
+	__u32 vlan_id;          /* Outer VLAN the lease was granted on, as seen by the
+	                         * XDP program (0 = untagged); the fast path only
+	                         * answers requests arriving on this VLAN */
 	__u8  client_class;     /* Residential=1, Business=2, etc. */
 	__u64 lease_expiry;     /* Unix timestamp (seconds) */
 	__u8  flags;            /* Static IP flag, etc. */

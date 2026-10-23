@@ -21,7 +21,7 @@ import (
 type PoolAssignment struct {
 	PoolID      uint32
 	AllocatedIP uint32 // Network byte order
-	VlanID      uint32 // Deprecated: use VLANKey for QinQ
+	VlanID      uint32 // Outer VLAN seen by the XDP program (0 = untagged); fast path answers only on it
 	ClientClass uint8
 	LeaseExpiry uint64 // Unix timestamp (seconds)
 	Flags       uint8
@@ -77,6 +77,9 @@ type Loader struct {
 	logger  *zap.Logger
 	xdpMode link.XDPAttachFlags
 
+	// Mode the program actually got (driver mode can fall back to generic)
+	attachedMode link.XDPAttachFlags
+
 	// eBPF resources
 	collection           *ebpf.Collection
 	xdpLink              link.Link
@@ -106,6 +109,20 @@ func WithXDPMode(mode link.XDPAttachFlags) LoaderOption {
 	}
 }
 
+// ParseXDPMode maps a CLI mode name to XDP attach flags: "generic" (SKB mode,
+// works with any driver), "native" (driver mode) or "offload" (NIC hardware).
+func ParseXDPMode(name string) (link.XDPAttachFlags, error) {
+	switch name {
+	case "generic":
+		return link.XDPGenericMode, nil
+	case "native":
+		return link.XDPDriverMode, nil
+	case "offload":
+		return link.XDPOffloadMode, nil
+	}
+	return 0, fmt.Errorf("invalid XDP mode %q (must be generic, native or offload)", name)
+}
+
 // NewLoader creates a new eBPF program loader
 func NewLoader(iface string, logger *zap.Logger, opts ...LoaderOption) (*Loader, error) {
 	if iface == "" {
@@ -124,6 +141,19 @@ func NewLoader(iface string, logger *zap.Logger, opts ...LoaderOption) (*Loader,
 	}
 
 	return l, nil
+}
+
+// resolveBPFPath finds a relative BPF object path in the working directory,
+// or else next to the executable
+func resolveBPFPath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		exe, _ := os.Executable()
+		return filepath.Join(filepath.Dir(exe), path)
+	}
+	return path
 }
 
 // checkBPFCapabilities verifies the process has CAP_BPF or CAP_SYS_ADMIN,
@@ -196,16 +226,7 @@ func (l *Loader) Load(ctx context.Context) error {
 		zap.String("mac", iface.HardwareAddr.String()),
 	)
 
-	// Resolve BPF path
-	bpfPath := l.bpfPath
-	if !filepath.IsAbs(bpfPath) {
-		// Try relative to working directory
-		if _, err := os.Stat(bpfPath); os.IsNotExist(err) {
-			// Try relative to executable
-			exe, _ := os.Executable()
-			bpfPath = filepath.Join(filepath.Dir(exe), l.bpfPath)
-		}
-	}
+	bpfPath := resolveBPFPath(l.bpfPath)
 
 	// Load compiled eBPF program
 	spec, err := ebpf.LoadCollectionSpec(bpfPath)
@@ -311,6 +332,9 @@ func (l *Loader) Load(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to attach XDP program: %w", err)
 		}
+		l.attachedMode = link.XDPGenericMode
+	} else {
+		l.attachedMode = l.xdpMode
 	}
 	l.xdpLink = xdpLink
 
@@ -344,6 +368,29 @@ func (l *Loader) Close() error {
 		return errs[0]
 	}
 	return nil
+}
+
+// AttachedXDPMode returns the mode the XDP program was attached in, which
+// is generic mode if driver mode was requested but not supported.
+func (l *Loader) AttachedXDPMode() link.XDPAttachFlags {
+	return l.attachedMode
+}
+
+// SetPPPoEProgram installs the PPPoE upstream program as the tail call for
+// PPPoE session frames (pppoe_progs slot 0). Passing nil removes it.
+func (l *Loader) SetPPPoEProgram(prog *ebpf.Program) error {
+	if l.collection == nil {
+		return fmt.Errorf("eBPF program not loaded")
+	}
+	progs := l.collection.Maps["pppoe_progs"]
+	if progs == nil {
+		return fmt.Errorf("pppoe_progs map not found in %s (rebuild the BPF objects)", l.bpfPath)
+	}
+	var key uint32
+	if prog == nil {
+		return progs.Delete(&key)
+	}
+	return progs.Put(&key, prog)
 }
 
 // === Map Operations ===
@@ -662,19 +709,23 @@ func (l *Loader) HasCircuitIDSubscriberSupport() bool {
 
 // === Helper Functions ===
 
-// IPToUint32 converts a net.IP to uint32 (network byte order)
+// IPToUint32 converts a net.IP to a uint32 whose in-memory bytes are the
+// address in network byte order. cilium/ebpf stores map keys and values in
+// host byte order, so this is the value the eBPF side reads as a __be32
+// (e.g. iph->saddr). A BigEndian conversion would be byte-swapped in the
+// map on little-endian hosts (x86_64, arm64).
 func IPToUint32(ip net.IP) uint32 {
 	ip = ip.To4()
 	if ip == nil {
 		return 0
 	}
-	return binary.BigEndian.Uint32(ip)
+	return binary.NativeEndian.Uint32(ip)
 }
 
-// Uint32ToIP converts a uint32 (network byte order) to net.IP
+// Uint32ToIP is the inverse of IPToUint32.
 func Uint32ToIP(n uint32) net.IP {
 	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, n)
+	binary.NativeEndian.PutUint32(ip, n)
 	return ip
 }
 

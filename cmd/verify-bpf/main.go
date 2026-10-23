@@ -28,6 +28,7 @@ var programs = []program{
 	{"bpf/qos_ratelimit.bpf.o", "TC QoS rate limiting"},
 	{"bpf/nat44.bpf.o", "NAT44/CGNAT"},
 	{"bpf/antispoof.bpf.o", "TC anti-spoofing"},
+	{"bpf/pppoe_dataplane.bpf.o", "XDP PPPoE data plane"},
 }
 
 func main() {
@@ -71,8 +72,9 @@ func verify(p program) error {
 	for _, m := range spec.Maps {
 		switch m.Type {
 		case ebpf.RingBuf:
-			// Ring buffers require page-aligned power-of-2 size.
-			m.MaxEntries = 4096
+			// Ring buffers require page-aligned power-of-2 size; the page
+			// size is 64K on some arm64 kernels (e.g. Marvell OCTEON 10).
+			m.MaxEntries = uint32(os.Getpagesize())
 		default:
 			if m.MaxEntries > 1 {
 				m.MaxEntries = 1

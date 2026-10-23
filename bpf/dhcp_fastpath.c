@@ -87,7 +87,12 @@ struct dhcp_packet {
 #define BOOTREPLY   2
 
 /* Maximum DHCP options we'll write in reply */
-#define MAX_DHCP_REPLY_OPTIONS_LEN 64
+/* Upper bound on the options build_dhcp_options() writes:
+ * 53(3) + 54(6) + 51(6) + 1(6) + 3(6) + 6(2+8) + 58(6) + 59(6) + 255(1) = 50.
+ * Must stay <= 60 so a minimum-size (300-byte BOOTP) request can carry the
+ * reply in place; the reply is then never larger than the request.
+ */
+#define MAX_DHCP_REPLY_OPTIONS_LEN 50
 
 /* DHCP broadcast flag (bit 15) */
 #define DHCP_FLAG_BROADCAST 0x8000
@@ -217,31 +222,44 @@ static __always_inline __u8 get_dhcp_msg_type(void *dhcp_base, void *data_end) {
 	/* DHCP options start at offset 240 (after fixed header + magic cookie) */
 	__u8 *opts = (__u8 *)dhcp_base + 240;
 
-	/* Check we have room for 12 bytes of options */
-	if ((void *)(opts + 12) > data_end)
-		return 0;
+	/* Bounds are checked per position rather than requiring 12 bytes up
+	 * front: short requests (e.g. 250-byte BOOTP with 10 option bytes)
+	 * still carry Option 53 at offset 0.
+	 */
 
 	/* Check fixed offset 0: [53][1][type] */
+	if ((void *)(opts + 3) > data_end)
+		return 0;
 	if (opts[0] == 53 && opts[1] == 1)
 		return opts[2];
 
 	/* Check fixed offset 1: [pad][53][1][type] */
+	if ((void *)(opts + 4) > data_end)
+		return 0;
 	if (opts[1] == 53 && opts[2] == 1)
 		return opts[3];
 
 	/* Check fixed offset 3: common for small first option */
+	if ((void *)(opts + 6) > data_end)
+		return 0;
 	if (opts[3] == 53 && opts[4] == 1)
 		return opts[5];
 
 	/* Check fixed offset 4: another common position */
+	if ((void *)(opts + 7) > data_end)
+		return 0;
 	if (opts[4] == 53 && opts[5] == 1)
 		return opts[6];
 
 	/* Check fixed offset 5 */
+	if ((void *)(opts + 8) > data_end)
+		return 0;
 	if (opts[5] == 53 && opts[6] == 1)
 		return opts[7];
 
 	/* Check fixed offset 6 */
+	if ((void *)(opts + 9) > data_end)
+		return 0;
 	if (opts[6] == 53 && opts[7] == 1)
 		return opts[8];
 
@@ -613,12 +631,54 @@ static __always_inline struct pool_assignment *lookup_subscriber(
 }
 
 /* ========================================================================
+ * PPPoE Data Plane Hook
+ * ======================================================================== */
+
+#define ETH_P_PPP_SES 0x8864
+
+/* Slot 0 holds pppoe_upstream (bpf/pppoe_dataplane.c) when the PPPoE data
+ * plane is enabled; an XDP program on the access port can only be one
+ * program, so PPPoE session frames are handed over by tail call. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} pppoe_progs SEC(".maps");
+
+/* PPPoE session frame, untagged or with one VLAN tag */
+static __always_inline int is_pppoe_session(struct xdp_md *ctx) {
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+
+	if ((void *)(eth + 1) > data_end)
+		return 0;
+	if (eth->h_proto == bpf_htons(ETH_P_PPP_SES))
+		return 1;
+	if (eth->h_proto == bpf_htons(ETH_P_8021Q) || eth->h_proto == bpf_htons(ETH_P_8021AD)) {
+		struct vlan_hdr *vhdr = (void *)(eth + 1);
+		if ((void *)(vhdr + 1) > data_end)
+			return 0;
+		return vhdr->h_vlan_encapsulated_proto == bpf_htons(ETH_P_PPP_SES);
+	}
+	return 0;
+}
+
+/* ========================================================================
  * Main XDP Program
  * ======================================================================== */
 
 SEC("xdp")
 int dhcp_fastpath_prog(struct xdp_md *ctx) {
 	struct pkt_ctx pkt = {};
+
+	/* PPPoE session traffic goes to the PPPoE data plane; without one
+	 * loaded the tail call falls through and the kernel gets the frame */
+	if (is_pppoe_session(ctx)) {
+		bpf_tail_call(ctx, &pppoe_progs, 0);
+		return XDP_PASS;
+	}
 
 	/* Parse all packet headers with VLAN support (Issue #17) */
 	if (parse_packet_headers(ctx, &pkt) < 0)
@@ -686,6 +746,15 @@ int dhcp_fastpath_prog(struct xdp_md *ctx) {
 		return XDP_PASS;
 	}
 
+	/* Only answer on the VLAN the lease was granted on. On a trunk port the
+	 * same MAC can appear on another VLAN, which must not be handed this
+	 * VLAN's address; let the slow path for that VLAN (if any) decide.
+	 */
+	if (assignment->vlan_id != pkt.vlan_id) {
+		update_stat(STAT_FASTPATH_MISS);
+		return XDP_PASS;
+	}
+
 	/* Check if lease is still valid */
 	__u64 now = bpf_ktime_get_ns() / 1000000000;  /* Convert to seconds */
 	if (now > assignment->lease_expiry) {
@@ -701,9 +770,6 @@ int dhcp_fastpath_prog(struct xdp_md *ctx) {
 		return XDP_PASS;
 	}
 
-	/* CACHE HIT - Fast path! Generate reply in kernel */
-	update_stat(STAT_FASTPATH_HIT);
-
 	/* Get server configuration (Issue #17: use for MAC address) */
 	__u32 config_key = 0;
 	struct dhcp_server_config *config = bpf_map_lookup_elem(&server_config, &config_key);
@@ -712,10 +778,52 @@ int dhcp_fastpath_prog(struct xdp_md *ctx) {
 		return XDP_PASS;
 	}
 
+	/* Everything that can fail must be checked before the packet is touched:
+	 * once headers are rewritten, XDP_PASS would hand the slow path a
+	 * half-built reply (with ip->check = 0) that the kernel drops, and the
+	 * client gets no answer at all.
+	 *
+	 * The reply is built with a 20-byte IP header, so requests carrying IP
+	 * options go to the slow path. With MAX_DHCP_REPLY_OPTIONS_LEN of room
+	 * after the fixed DHCP header, the reply is never larger than the
+	 * request, so bpf_xdp_adjust_tail() below only ever shrinks.
+	 */
+	if (pkt.ip->ihl != 5) {
+		update_stat(STAT_FASTPATH_MISS);
+		return XDP_PASS;
+	}
+
+	/* Requests shorter than the RFC 1542 300-byte BOOTP minimum (BNG
+	 * Blaster sends 250-266 bytes) lack room for the reply options, so
+	 * grow the packet first. This is still before any header is rewritten:
+	 * the IP/UDP lengths are unchanged and the new tail is ignored by the
+	 * stack, so a failed grow or re-parse can fall back to the slow path.
+	 */
+	__u32 needed_len = sizeof(struct ethhdr) + pkt.vlan_offset + sizeof(struct iphdr) +
+	                   sizeof(struct udphdr) + sizeof(struct dhcp_packet) +
+	                   MAX_DHCP_REPLY_OPTIONS_LEN;
+	void *cur_data = (void *)(long)ctx->data;
+	void *cur_end = (void *)(long)ctx->data_end;
+	__u32 cur_len = (__u32)((long)cur_end - (long)cur_data);
+	if (cur_len < needed_len) {
+		if (bpf_xdp_adjust_tail(ctx, (int)(needed_len - cur_len)) != 0 ||
+		    parse_packet_headers(ctx, &pkt) < 0) {
+			update_stat(STAT_FASTPATH_MISS);
+			return XDP_PASS;
+		}
+	}
+	if ((void *)pkt.dhcp->options + MAX_DHCP_REPLY_OPTIONS_LEN > pkt.data_end) {
+		update_stat(STAT_FASTPATH_MISS);
+		return XDP_PASS;
+	}
+
+	/* CACHE HIT - Fast path! Generate reply in kernel */
+	update_stat(STAT_FASTPATH_HIT);
+
 	/* Determine reply type */
 	__u8 reply_type = (msg_type == DHCP_DISCOVER) ? DHCP_OFFER : DHCP_ACK;
 
-	/* === Build DHCP Reply === */
+	/* === Build DHCP Reply (no XDP_PASS from here on) === */
 
 	/* Check if packet was relayed (giaddr != 0) */
 	__u32 giaddr = pkt.dhcp->giaddr;
@@ -765,15 +873,14 @@ int dhcp_fastpath_prog(struct xdp_md *ctx) {
 	__builtin_memset(pkt.dhcp->sname, 0, sizeof(pkt.dhcp->sname));
 	__builtin_memset(pkt.dhcp->file, 0, sizeof(pkt.dhcp->file));
 
-	/* Build DHCP options */
-	CHECK_BOUNDS_PASS(pkt.dhcp->options, pkt.data_end, MAX_DHCP_REPLY_OPTIONS_LEN);
-
+	/* Build DHCP options (room was checked above; failure here would mean
+	 * the packet is already modified, so drop rather than pass it on) */
 	int opt_len = build_dhcp_options(pkt.dhcp->options, pkt.data_end,
 	                                  reply_type, pool, assignment,
 	                                  server_ip);
 	if (opt_len < 0) {
 		update_stat(STAT_ERROR);
-		return XDP_PASS;
+		return XDP_DROP;
 	}
 
 	/* Calculate total packet size */
@@ -795,12 +902,12 @@ int dhcp_fastpath_prog(struct xdp_md *ctx) {
 	void *data_end = (void *)(long)ctx->data_end;
 	__u16 orig_len = (__u16)((long)data_end - (long)data);
 
-	/* Adjust packet tail if needed */
+	/* Trim the packet to the reply size (delta <= 0, see checks above) */
 	int delta = (int)total_len - (int)orig_len;
 	if (delta != 0) {
 		if (bpf_xdp_adjust_tail(ctx, delta) != 0) {
 			update_stat(STAT_ERROR);
-			return XDP_PASS;
+			return XDP_DROP;
 		}
 		/* Note: After adjust_tail, packet pointers are invalidated.
 		 * We've already written all header fields, so we can proceed

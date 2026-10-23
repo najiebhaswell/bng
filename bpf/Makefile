@@ -9,7 +9,7 @@ ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 OUTPUT := .
 
 # eBPF programs to compile
-BPF_PROGRAMS := dhcp_fastpath.bpf.o qos_ratelimit.bpf.o nat44.bpf.o antispoof.bpf.o
+BPF_PROGRAMS := dhcp_fastpath.bpf.o qos_ratelimit.bpf.o nat44.bpf.o antispoof.bpf.o pppoe_dataplane.bpf.o
 
 # Compiler flags
 # Note: -Wno-pass-failed silences warnings when #pragma unroll can't be honored

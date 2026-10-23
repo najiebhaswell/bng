@@ -52,7 +52,7 @@ jobs:
         if: success()
         run: |
           cd bpf
-          for prog in qos_ratelimit.bpf.o nat44.bpf.o antispoof.bpf.o; do
+          for prog in qos_ratelimit.bpf.o nat44.bpf.o antispoof.bpf.o pppoe_dataplane.bpf.o; do
             echo "Testing $prog..."
             sudo bpftool prog load "$prog" "/sys/fs/bpf/test_$(basename $prog .bpf.o)" || {
               echo "$prog failed verifier"

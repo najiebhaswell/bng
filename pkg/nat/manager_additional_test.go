@@ -1,6 +1,7 @@
 package nat
 
 import (
+	"encoding/binary"
 	"net"
 	"testing"
 
@@ -490,8 +491,12 @@ func TestIPConversionAdditional(t *testing.T) {
 	for _, tt := range tests {
 		ip := net.ParseIP(tt.ip)
 		key := ipToKey(ip)
-		if key != tt.expected {
-			t.Errorf("ipToKey(%s) = 0x%08X, want 0x%08X", tt.ip, key, tt.expected)
+		// The key's in-memory bytes must be the address in network order,
+		// since that is what the eBPF program compares against.
+		mem := make([]byte, 4)
+		binary.NativeEndian.PutUint32(mem, key)
+		if got := binary.BigEndian.Uint32(mem); got != tt.expected {
+			t.Errorf("ipToKey(%s) in-memory = 0x%08X, want 0x%08X", tt.ip, got, tt.expected)
 		}
 
 		// Test round trip

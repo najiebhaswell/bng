@@ -351,16 +351,19 @@ func (m *Manager) AddPublicIP(ip net.IP) error {
 
 // AddPublicIPRange adds a range of public IPs to the NAT pool
 func (m *Manager) AddPublicIPRange(startIP, endIP net.IP) error {
-	start := ipToKey(startIP.To4())
-	end := ipToKey(endIP.To4())
+	// Range arithmetic needs numeric (big-endian) values, not map keys
+	start := binary.BigEndian.Uint32(startIP.To4())
+	end := binary.BigEndian.Uint32(endIP.To4())
 
 	if start > end {
 		return fmt.Errorf("start IP must be less than or equal to end IP")
 	}
 
-	for ip := start; ip <= end; ip++ {
-		if err := m.AddPublicIP(keyToIP(ip)); err != nil {
-			return fmt.Errorf("failed to add IP %s: %w", keyToIP(ip).String(), err)
+	for n := start; n <= end; n++ {
+		ip := make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, n)
+		if err := m.AddPublicIP(ip); err != nil {
+			return fmt.Errorf("failed to add IP %s: %w", ip.String(), err)
 		}
 	}
 
@@ -820,16 +823,18 @@ func (m *Manager) SetLogger(logger *Logger) {
 	m.natLogger = logger
 }
 
-// ipToKey converts an IPv4 address to a uint32 key (network byte order)
+// ipToKey converts an IPv4 address to a uint32 key whose in-memory bytes are
+// in network byte order, matching the __be32 addresses the eBPF program
+// reads from packet headers.
 func ipToKey(ip net.IP) uint32 {
 	ip4 := ip.To4()
-	return binary.BigEndian.Uint32(ip4)
+	return binary.NativeEndian.Uint32(ip4)
 }
 
 // keyToIP converts a uint32 key to an IPv4 address
 func keyToIP(key uint32) net.IP {
 	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, key)
+	binary.NativeEndian.PutUint32(ip, key)
 	return ip
 }
 

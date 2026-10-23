@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"runtime"
@@ -12,6 +13,15 @@ import (
 	"github.com/cilium/ebpf/link"
 	"go.uber.org/zap"
 )
+
+// beToNative returns the uint32 whose in-memory bytes are n in big-endian
+// (network) order. That is what the eBPF side reads as a __be32, and so what
+// IPToUint32 must produce for the address n.
+func beToNative(n uint32) uint32 {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, n)
+	return binary.NativeEndian.Uint32(b)
+}
 
 func TestIPToUint32(t *testing.T) {
 	tests := []struct {
@@ -27,8 +37,8 @@ func TestIPToUint32(t *testing.T) {
 	for _, tt := range tests {
 		ip := net.ParseIP(tt.ip)
 		got := IPToUint32(ip)
-		if got != tt.expected {
-			t.Errorf("IPToUint32(%s) = 0x%08X, want 0x%08X", tt.ip, got, tt.expected)
+		if want := beToNative(tt.expected); got != want {
+			t.Errorf("IPToUint32(%s) = 0x%08X, want 0x%08X", tt.ip, got, want)
 		}
 	}
 }
@@ -45,9 +55,30 @@ func TestUint32ToIP(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := Uint32ToIP(tt.n)
+		got := Uint32ToIP(beToNative(tt.n))
 		if got.String() != tt.expected {
 			t.Errorf("Uint32ToIP(0x%08X) = %s, want %s", tt.n, got, tt.expected)
+		}
+	}
+}
+
+func TestParseXDPMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		want    link.XDPAttachFlags
+		wantErr bool
+	}{
+		{"generic", link.XDPGenericMode, false},
+		{"native", link.XDPDriverMode, false},
+		{"offload", link.XDPOffloadMode, false},
+		{"", 0, true},
+		{"driver", 0, true},
+	}
+
+	for _, tt := range tests {
+		got, err := ParseXDPMode(tt.name)
+		if (err != nil) != tt.wantErr || got != tt.want {
+			t.Errorf("ParseXDPMode(%q) = %v, %v; want %v, err=%v", tt.name, got, err, tt.want, tt.wantErr)
 		}
 	}
 }
@@ -1130,8 +1161,8 @@ func TestIPConversionEdgeCases(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ip := net.ParseIP(tt.ip)
 			n := IPToUint32(ip)
-			if n != tt.n {
-				t.Errorf("IPToUint32(%s) = 0x%08X, want 0x%08X", tt.ip, n, tt.n)
+			if want := beToNative(tt.n); n != want {
+				t.Errorf("IPToUint32(%s) = 0x%08X, want 0x%08X", tt.ip, n, want)
 			}
 			back := Uint32ToIP(n)
 			if !ip.To4().Equal(back) {
