@@ -425,6 +425,13 @@ func addMessageAuthenticator(packet *radius.Packet, secret []byte) error {
 	if err != nil {
 		return err
 	}
+	// Requests whose Authenticator is an MD5 over the packet (Encode fills
+	// it in) are signed with a zero Authenticator (RFC 3579 section 3.2,
+	// RFC 5176 section 3.1)
+	switch packet.Code {
+	case radius.CodeAccountingRequest, radius.CodeDisconnectRequest, radius.CodeCoARequest:
+		copy(encoded[4:20], make([]byte, 16))
+	}
 
 	// Calculate HMAC-MD5
 	hash := hmac.New(md5.New, secret)
