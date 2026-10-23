@@ -79,6 +79,22 @@ type Session struct {
 	negSentAt  time.Time // When it was last sent
 	negRetries int       // Retransmissions in this phase
 
+	// Authorization from Access-Accept, changed later by CoA
+	FramedIP        net.IP        // Framed-IP-Address (nil = from the pool)
+	UpRateBPS       uint64        // Upload limit in bits/s (0 = unlimited)
+	DownRateBPS     uint64        // Download limit in bits/s (0 = unlimited)
+	SessionLimit    time.Duration // Session-Timeout (0 = none)
+	IdleLimit       time.Duration // Idle-Timeout (0 = none)
+	InterimInterval time.Duration // Acct-Interim-Interval (0 = server default)
+
+	// Accounting and limits, only touched by the server goroutine
+	acctStarted     bool      // Accounting-Start sent, so a Stop is owed
+	nextInterim     time.Time // Next Interim-Update (zero = none)
+	limitsFrom      time.Time // Session-Timeout is counted from here
+	lastTraffic     time.Time // Data plane counters last moved
+	lastUpPackets   uint64
+	lastDownPackets uint64
+
 	// IP configuration
 	ClientIP     net.IP
 	ServerIP     net.IP

@@ -173,6 +173,7 @@ type Allocation struct {
 	PortEnd      uint16
 	PoolIndex    int
 	SubscriberID uint32
+	Username     string // Subscriber login, if known
 	AllocatedAt  time.Time
 }
 

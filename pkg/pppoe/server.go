@@ -30,9 +30,33 @@ const (
 // (e.g. the XDP PPPoE data plane). Sessions are added once IPCP is up and
 // removed when they end.
 type Dataplane interface {
+	// AddSession installs a session with its rate limit and zeroed counters
 	AddSession(session *Session) error
 	RemoveSession(session *Session) error
+	// SetRate changes an established session's limit (bits/s, 0 = unlimited)
+	SetRate(session *Session, upBPS, downBPS uint64) error
+	// Counters returns the traffic forwarded for an established session
+	Counters(session *Session) (Counters, error)
 }
+
+// Counters is a session's forwarded traffic; In is from the subscriber, as
+// in RADIUS accounting
+type Counters struct {
+	InPackets  uint64
+	InOctets   uint64
+	OutPackets uint64
+	OutOctets  uint64
+}
+
+// acctQueueLen bounds the accounting backlog; RADIUS being slow or down must
+// not hold up the PPPoE processing goroutine
+const (
+	acctQueueLen = 16384
+	acctWorkers  = 4
+	acctTimeout  = 10 * time.Second
+	// cmdTimeout bounds how long a CoA waits for the processing goroutine
+	cmdTimeout = 5 * time.Second
+)
 
 // rawSocket is an interface for platform-specific raw socket operations
 type rawSocket interface {
@@ -66,6 +90,19 @@ type Server struct {
 
 	// RADIUS client (optional)
 	radiusClient *radius.Client
+
+	// QoS policies a Filter-Id can name (optional)
+	policies *radius.PolicyManager
+
+	// Accounting: Interim-Update interval when RADIUS sends none, and the
+	// queue the accounting workers send from
+	defaultInterim time.Duration
+	acctQueue      chan *radius.AcctRequest
+	acctDropped    uint64
+
+	// Work run on the processing goroutine on behalf of other goroutines
+	// (CoA and Disconnect requests)
+	cmds chan func()
 
 	// Data plane for established sessions (optional)
 	dataplane Dataplane
@@ -140,6 +177,23 @@ func (p *IPPool) Allocate(sessionID string) net.IP {
 	return ip
 }
 
+// Reserve assigns a specific address (RADIUS Framed-IP-Address) to a
+// session. Addresses outside the pool are not tracked and always succeed;
+// an address inside the pool must be free.
+func (p *IPPool) Reserve(sessionID string, ip net.IP) bool {
+	if !p.network.Contains(ip) {
+		return true
+	}
+	for i, avail := range p.available {
+		if avail.Equal(ip) {
+			p.available = append(p.available[:i], p.available[i+1:]...)
+			p.allocated[sessionID] = avail
+			return true
+		}
+	}
+	return false
+}
+
 // Release releases an IP back to the pool
 func (p *IPPool) Release(sessionID string) {
 	if ip, ok := p.allocated[sessionID]; ok {
@@ -163,6 +217,10 @@ type ServerConfig struct {
 	AuthType       string        // "pap", "chap", or "both" (default: "pap")
 	SessionTimeout time.Duration // Idle timeout for sessions
 	MRU            uint16        // Maximum Receive Unit (default: 1492)
+
+	// Interim-Update interval when Access-Accept has no Acct-Interim-Interval
+	// (0 = Start and Stop only)
+	AcctInterimInterval time.Duration
 }
 
 // NewServer creates a new PPPoE server
@@ -251,12 +309,20 @@ func newServerWithInterface(cfg ServerConfig, logger *zap.Logger, iface *net.Int
 		clientIPPool:   pool,
 		primaryDNS:     net.ParseIP(cfg.PrimaryDNS),
 		secondaryDNS:   net.ParseIP(cfg.SecondaryDNS),
+		defaultInterim: cfg.AcctInterimInterval,
+		cmds:           make(chan func(), 64),
 	}, nil
 }
 
-// SetRADIUSClient sets the RADIUS client for authentication
+// SetRADIUSClient sets the RADIUS client for authentication and accounting
 func (s *Server) SetRADIUSClient(client *radius.Client) {
 	s.radiusClient = client
+}
+
+// SetPolicyManager sets the QoS policies an Access-Accept or CoA Filter-Id
+// can name. Call before Start.
+func (s *Server) SetPolicyManager(pm *radius.PolicyManager) {
+	s.policies = pm
 }
 
 // SetDataplane sets the data plane that forwards established sessions.
@@ -282,6 +348,13 @@ func (s *Server) Start(ctx context.Context) error {
 	if err := s.sessionSocket.open(s.iface, EtherTypePPPoESession); err != nil {
 		s.socket.close()
 		return fmt.Errorf("failed to open session socket: %w", err)
+	}
+
+	if s.radiusClient != nil {
+		s.acctQueue = make(chan *radius.AcctRequest, acctQueueLen)
+		for i := 0; i < acctWorkers; i++ {
+			go s.acctWorker(ctx)
+		}
 	}
 
 	// Both sockets feed one processing goroutine, so session state and the
@@ -354,10 +427,13 @@ func (s *Server) processLoop(ctx context.Context, frames <-chan []byte) {
 			return
 		case frame := <-frames:
 			s.handleFrame(frame)
+		case cmd := <-s.cmds:
+			cmd()
 		case <-ticker.C:
 			s.cleanupExpired()
 		case now := <-restart.C:
 			s.retransmit(now)
+			s.tickSessions(now)
 		}
 	}
 }
@@ -391,7 +467,7 @@ func (s *Server) retransmit(now time.Time) {
 		}
 
 		if session.negRetries >= maxConfigure {
-			s.terminateSession(session, "negotiation timed out")
+			s.terminateSession(session, "negotiation timed out", radius.TerminateCauseLostCarrier)
 			continue
 		}
 		session.negRetries++
@@ -533,7 +609,7 @@ func (s *Server) handlePADR(clientMAC net.HardwareAddr, tags []Tag) {
 			zap.Uint16("session_id", old.ID),
 			zap.String("client_mac", clientMAC.String()),
 		)
-		s.endSession(old)
+		s.endSession(old, radius.TerminateCauseLostCarrier)
 	}
 
 	// Create session
@@ -594,7 +670,7 @@ func (s *Server) handlePADT(clientMAC net.HardwareAddr, sessionID uint16) {
 		zap.String("client_mac", clientMAC.String()),
 	)
 
-	s.endSession(session)
+	s.endSession(session, radius.TerminateCauseUserRequest)
 }
 
 // handleSession handles PPPoE session packets (PPP)
@@ -766,7 +842,7 @@ func (s *Server) maybeStartAuth(session *Session) {
 func (s *Server) handleLCPConfigNak(session *Session, pkt *LCPPacket) {
 	session.lcpConfigNaks++
 	if session.lcpConfigNaks > maxLCPConfigNaks {
-		s.terminateSession(session, "LCP negotiation did not converge")
+		s.terminateSession(session, "LCP negotiation did not converge", radius.TerminateCauseNASError)
 		return
 	}
 
@@ -785,7 +861,7 @@ func (s *Server) handleLCPConfigNak(session *Session, pkt *LCPPacket) {
 				zap.String("requested", fmt.Sprintf("0x%x", opt.Data)),
 				zap.String("auth_type", s.authType),
 			)
-			s.terminateSession(session, "no common auth protocol")
+			s.terminateSession(session, "no common auth protocol", radius.TerminateCauseNASError)
 			return
 		}
 		session.AuthProto = proto
@@ -798,7 +874,7 @@ func (s *Server) handleLCPConfigNak(session *Session, pkt *LCPPacket) {
 // (MRU, Magic-Number, Auth-Protocol) is one we cannot drop safely, in
 // particular authentication, so the session is ended.
 func (s *Server) handleLCPConfigReject(session *Session, pkt *LCPPacket) {
-	s.terminateSession(session, "peer rejected LCP options")
+	s.terminateSession(session, "peer rejected LCP options", radius.TerminateCauseNASError)
 }
 
 // authProtoAllowed reports whether an Auth-Protocol suggested by the peer
@@ -816,7 +892,8 @@ func (s *Server) authProtoAllowed(proto uint16, data []byte) bool {
 
 // terminateSession ends a session from the server side: LCP
 // Terminate-Request, then PADT, then the session and its IP are released.
-func (s *Server) terminateSession(session *Session, reason string) {
+// cause is the RADIUS Acct-Terminate-Cause for the Accounting-Stop.
+func (s *Server) terminateSession(session *Session, reason string, cause uint32) {
 	s.logger.Info("Terminating PPPoE session",
 		zap.Uint16("session_id", session.ID),
 		zap.String("client_mac", session.ClientMAC.String()),
@@ -833,12 +910,17 @@ func (s *Server) terminateSession(session *Session, reason string) {
 	s.sendDiscoveryPacket(session.ClientMAC, CodePADT, session.ID, nil)
 	atomic.AddUint64(&s.padtSent, 1)
 
-	s.endSession(session)
+	s.endSession(session, cause)
 }
 
-// endSession releases everything a session holds: its data plane entries,
-// its IP address and the session itself
-func (s *Server) endSession(session *Session) {
+// endSession releases everything a session holds: its accounting (an
+// Accounting-Stop with the final counters, read before the data plane
+// entries go), its data plane entries, its IP address and the session itself
+func (s *Server) endSession(session *Session, cause uint32) {
+	if session.acctStarted {
+		s.sendAccounting(session, radius.AcctStatusStop, cause, nil)
+		session.acctStarted = false
+	}
 	if s.dataplane != nil && session.IsEstablished() {
 		if err := s.dataplane.RemoveSession(session); err != nil {
 			s.logger.Warn("Failed to remove PPPoE session from data plane",
@@ -874,7 +956,7 @@ func (s *Server) handleLCPTermRequest(session *Session, pkt *LCPPacket) {
 	s.sendPPPPacket(session, ProtocolLCP, resp.Serialize())
 
 	// Terminate session
-	s.endSession(session)
+	s.endSession(session, radius.TerminateCauseUserRequest)
 }
 
 // handlePAP handles PAP authentication packets
@@ -973,16 +1055,13 @@ func (s *Server) handlePAP(session *Session, data []byte) {
 	s.sendPPPPacket(session, ProtocolPAP, respData)
 
 	if authenticated {
-		// Store RADIUS class if present
-		if authResp != nil {
-			session.Class = authResp.Class
-		}
+		s.applyAuthorization(session, authResp)
 		// Move to IPCP
 		session.SetState(StateIPCPNegotiation)
 		s.startIPCPNegotiation(session)
 	} else {
-		// Terminate
-		session.SetState(StateClosed)
+		// RFC 1994: after a Failure the authenticator ends the link
+		s.terminateSession(session, "authentication failed", radius.TerminateCauseUserRequest)
 	}
 }
 
@@ -1100,23 +1179,28 @@ func (s *Server) handleCHAP(session *Session, data []byte) {
 	s.sendPPPPacket(session, ProtocolCHAP, respData)
 
 	if authenticated {
-		// Store RADIUS class if present
-		if authResp != nil {
-			session.Class = authResp.Class
-		}
+		s.applyAuthorization(session, authResp)
 		// Move to IPCP
 		session.SetState(StateIPCPNegotiation)
 		s.startIPCPNegotiation(session)
 	} else {
-		// Terminate
-		session.SetState(StateClosed)
+		// RFC 1994: after a Failure the authenticator ends the link
+		s.terminateSession(session, "authentication failed", radius.TerminateCauseUserRequest)
 	}
 }
 
 // startIPCPNegotiation initiates IPCP negotiation
 func (s *Server) startIPCPNegotiation(session *Session) {
-	// Allocate IP for client
-	if s.clientIPPool != nil {
+	// Address for the client: RADIUS Framed-IP-Address, else from the pool
+	switch {
+	case session.FramedIP != nil:
+		if s.clientIPPool != nil && !s.clientIPPool.Reserve(session.SessionID, session.FramedIP) {
+			s.terminateSession(session, "Framed-IP-Address "+session.FramedIP.String()+" is in use",
+				radius.TerminateCauseNASError)
+			return
+		}
+		session.ClientIP = session.FramedIP
+	case s.clientIPPool != nil:
 		session.ClientIP = s.clientIPPool.Allocate(session.SessionID)
 	}
 	session.ServerIP = s.serverIP
@@ -1125,7 +1209,7 @@ func (s *Server) startIPCPNegotiation(session *Session) {
 		s.logger.Error("Failed to allocate IP for session",
 			zap.Uint16("session_id", session.ID),
 		)
-		s.terminateSession(session, "no IP address available")
+		s.terminateSession(session, "no IP address available", radius.TerminateCauseNASError)
 		return
 	}
 
@@ -1223,21 +1307,44 @@ func (s *Server) handleIPCPConfigRequest(session *Session, pkt *LCPPacket) {
 
 // handleIPCPConfigAck handles IPCP Configure-Ack
 func (s *Server) handleIPCPConfigAck(session *Session, pkt *LCPPacket) {
+	// A retransmitted Ack must not restart the session's accounting
+	if session.IsEstablished() {
+		return
+	}
 	session.SetState(StateEstablished)
 
 	s.logger.Info("PPPoE session established",
 		zap.Uint16("session_id", session.ID),
 		zap.String("username", session.Username),
 		zap.String("client_ip", session.ClientIP.String()),
+		zap.Uint64("up_bps", session.UpRateBPS),
+		zap.Uint64("down_bps", session.DownRateBPS),
 	)
 
+	// A session the data plane cannot forward (e.g. no CGNAT port block
+	// left) is no use to the subscriber: end it so the client retries
 	if s.dataplane != nil {
 		if err := s.dataplane.AddSession(session); err != nil {
 			s.logger.Error("Failed to add PPPoE session to data plane",
 				zap.Uint16("session_id", session.ID),
 				zap.Error(err),
 			)
+			s.terminateSession(session, "data plane error", radius.TerminateCauseNASError)
+			return
 		}
+	}
+
+	now := time.Now()
+	session.limitsFrom = now
+	session.lastTraffic = now
+	session.lastUpPackets, session.lastDownPackets = 0, 0
+	session.nextInterim = time.Time{}
+	if interval := s.interimInterval(session); interval > 0 {
+		session.nextInterim = now.Add(interval)
+	}
+	if s.acctQueue != nil {
+		session.acctStarted = true
+		s.sendAccounting(session, radius.AcctStatusStart, 0, &Counters{})
 	}
 }
 
@@ -1306,7 +1413,7 @@ func (s *Server) cleanupExpired() {
 		inactive := now.Sub(session.LastActivity) > timeout
 		session.mu.RUnlock()
 		if inactive {
-			s.terminateSession(session, "idle timeout")
+			s.terminateSession(session, "no LCP keepalive", radius.TerminateCauseLostCarrier)
 		}
 	}
 }

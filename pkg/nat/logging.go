@@ -52,11 +52,13 @@ type PortBlockLogEntry struct {
 	Timestamp    time.Time `json:"timestamp"`
 	EventType    string    `json:"event_type"` // "port_block_assign", "port_block_release"
 	SubscriberID uint32    `json:"subscriber_id"`
+	Username     string    `json:"username,omitempty"`
 	PrivateIP    string    `json:"private_ip"`
 	PublicIP     string    `json:"public_ip"`
 	PortStart    uint16    `json:"port_start"`
 	PortEnd      uint16    `json:"port_end"`
 	BlockSize    uint16    `json:"block_size"`
+	DurationMs   int64     `json:"duration_ms,omitempty"` // How long the block was held (release only)
 }
 
 // Logger handles NAT translation logging for legal compliance
@@ -186,6 +188,7 @@ func (l *Logger) LogAllocation(alloc *Allocation) {
 			Timestamp:    time.Now().UTC(),
 			EventType:    "port_block_assign",
 			SubscriberID: alloc.SubscriberID,
+			Username:     alloc.Username,
 			PrivateIP:    alloc.PrivateIP.String(),
 			PublicIP:     alloc.PublicIP.String(),
 			PortStart:    alloc.PortStart,
@@ -233,6 +236,26 @@ func (l *Logger) LogDeallocation(privateIP, publicIP net.IP, portStart uint16, d
 		}
 		l.addEntry(entry)
 	}
+}
+
+// LogRelease logs the end of a port block allocation with everything
+// needed to trace the block afterwards: who held which ports, and when
+func (l *Logger) LogRelease(alloc *Allocation) {
+	if !l.enabled {
+		return
+	}
+	l.addPortBlockEntry(PortBlockLogEntry{
+		Timestamp:    time.Now().UTC(),
+		EventType:    "port_block_release",
+		SubscriberID: alloc.SubscriberID,
+		Username:     alloc.Username,
+		PrivateIP:    alloc.PrivateIP.String(),
+		PublicIP:     alloc.PublicIP.String(),
+		PortStart:    alloc.PortStart,
+		PortEnd:      alloc.PortEnd,
+		BlockSize:    alloc.PortEnd - alloc.PortStart + 1,
+		DurationMs:   time.Since(alloc.AllocatedAt).Milliseconds(),
+	})
 }
 
 // LogSession logs a NAT session creation
@@ -450,10 +473,11 @@ func (l *Logger) formatPortBlockEntry(entry PortBlockLogEntry) []byte {
 		return append(line, '\n')
 
 	case LogFormatSyslog:
-		return []byte(fmt.Sprintf("%s NAT %s: subscriber=%d private=%s public=%s ports=%d-%d\n",
+		return []byte(fmt.Sprintf("%s NAT %s: subscriber=%d user=%q private=%s public=%s ports=%d-%d\n",
 			entry.Timestamp.Format(time.RFC3339),
 			entry.EventType,
 			entry.SubscriberID,
+			entry.Username,
 			entry.PrivateIP,
 			entry.PublicIP,
 			entry.PortStart,

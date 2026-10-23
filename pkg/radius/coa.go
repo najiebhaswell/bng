@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -86,6 +87,10 @@ type CoARequest struct {
 	// QoS changes
 	QoSDownload uint32 // kbps
 	QoSUpload   uint32 // kbps
+	// Speed limit from Mikrotik-Rate-Limit in bits/s, valid if RateLimitSet
+	UploadBPS    uint64
+	DownloadBPS  uint64
+	RateLimitSet bool
 
 	// Raw attributes
 	Attributes []Attribute
@@ -236,6 +241,9 @@ func (s *CoAServer) receiveLoop(ctx context.Context) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			s.logger.Error("Read error", zap.Error(err))
 			continue
 		}
@@ -367,7 +375,18 @@ func (s *CoAServer) parseCoARequest(attrs []Attribute) *CoARequest {
 			}
 		case AttrFilterID:
 			req.FilterID = string(attr.Value)
-			// Vendor-specific QoS attributes would be handled here
+		case AttrVendorSpecific:
+			value, ok := vendorAttribute(attr.Value, VendorMikrotik, MikrotikRateLimitAttr)
+			if !ok {
+				continue
+			}
+			up, down, err := ParseMikrotikRateLimit(string(value))
+			if err != nil {
+				s.logger.Warn("Ignoring Mikrotik-Rate-Limit in CoA", zap.Error(err))
+				continue
+			}
+			req.UploadBPS, req.DownloadBPS, req.RateLimitSet = up, down, true
+			req.QoSUpload, req.QoSDownload = uint32(up/1000), uint32(down/1000)
 		}
 	}
 

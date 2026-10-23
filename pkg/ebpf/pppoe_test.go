@@ -38,7 +38,7 @@ func newTestPPPoEDataplane(t *testing.T) *PPPoEDataplane {
 	if _, err := os.Stat(testPPPoEObject); err != nil {
 		t.Skip("BPF object not built (make -C bpf)")
 	}
-	d, err := NewPPPoEDataplane(testPPPoEObject, zap.NewNop())
+	d, err := NewPPPoEDataplane(testPPPoEObject, PPPoEDataplaneOptions{NATMappings: 4096}, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,5 +241,55 @@ func TestDHCPFastPathTailCallsPPPoE(t *testing.T) {
 	want := append(ethernet(testServerMAC, testClientMAC, 3001, 0x0800), ip...)
 	if ret != xdpPass || !bytes.Equal(out[:len(want)], want) {
 		t.Fatalf("with PPPoE program: verdict = %d, output\n %x\nwant decapsulated\n %x", ret, out[:len(want)], want)
+	}
+}
+
+func TestPPPoEPolicing(t *testing.T) {
+	d := newTestPPPoEDataplane(t)
+	s := testSession(3001)
+	s.UpRateBPS = 1_000_000 // burst is the 32 KiB minimum
+	if err := d.AddSession(s); err != nil {
+		t.Fatal(err)
+	}
+	prog := d.UpstreamProgram()
+	ip := ipv4Packet(testClientIP, testRemoteIP, 64, 1400-28)
+	frame := pppoeFrame(3001, 0x1234, 0x0021, ip)
+
+	send := func(n int) (passed, dropped uint64) {
+		for i := 0; i < n; i++ {
+			switch ret, _ := run(t, prog, frame); ret {
+			case xdpPass:
+				passed++
+			case xdpDrop:
+				dropped++
+			default:
+				t.Fatalf("verdict = %d", ret)
+			}
+		}
+		return passed, dropped
+	}
+
+	passed, dropped := send(40)
+	// 32768 / 1400 = 23 packets fit the burst; refill during the test is
+	// a few bytes
+	if passed < 23 || passed > 24 || dropped == 0 {
+		t.Fatalf("passed %d, dropped %d; want about 23 passed and the rest dropped", passed, dropped)
+	}
+	c, err := d.SessionCounters(testClientIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UpPackets != passed || c.UpBytes != passed*1400 || c.UpDropped != dropped {
+		t.Fatalf("counters %+v; want %d packets, %d bytes, %d dropped", c, passed, passed*1400, dropped)
+	}
+
+	if err := d.SetSessionRate(testClientIP, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if p, dr := send(40); p != 40 || dr != 0 {
+		t.Fatalf("unlimited: passed %d, dropped %d; want all passed", p, dr)
+	}
+	if c, _ := d.SessionCounters(testClientIP); c.UpPackets != passed+40 {
+		t.Fatalf("UpPackets = %d, want %d", c.UpPackets, passed+40)
 	}
 }

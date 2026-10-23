@@ -83,7 +83,9 @@ type AuthResponse struct {
 	Class          []byte // Class attribute (for accounting)
 	DownloadBPS    uint64 // Download rate limit (bits/sec)
 	UploadBPS      uint64 // Upload rate limit (bits/sec)
-	Attributes     map[string]interface{}
+	// Acct-Interim-Interval in seconds (0 = not sent)
+	AcctInterimInterval uint32
+	Attributes          map[string]interface{}
 }
 
 // AcctRequest holds accounting request parameters
@@ -376,12 +378,27 @@ func (c *Client) parseAuthAttributes(response *radius.Packet, authResp *AuthResp
 		authResp.Class = class
 	}
 
-	// Look for vendor-specific QoS attributes
-	// Common vendor attribute types for bandwidth:
-	// - Cisco: AV-Pair (upload-bandwidth, download-bandwidth)
-	// - Mikrotik: Mikrotik-Rate-Limit
-	// - ChilliSpot: ChilliSpot-Bandwidth-Max-Up/Down
-	// For now, we'll use Filter-Id as a policy name lookup
+	// Acct-Interim-Interval
+	if interval, err := rfc2869.AcctInterimInterval_Lookup(response); err == nil {
+		authResp.AcctInterimInterval = uint32(interval)
+	}
+
+	// Speed limit: Mikrotik-Rate-Limit. Filter-Id can name a QoS policy instead.
+	for _, avp := range response.Attributes {
+		if avp.Type != rfc2865.VendorSpecific_Type {
+			continue
+		}
+		value, ok := vendorAttribute(avp.Attribute, VendorMikrotik, MikrotikRateLimitAttr)
+		if !ok {
+			continue
+		}
+		up, down, err := ParseMikrotikRateLimit(string(value))
+		if err != nil {
+			c.logger.Warn("Ignoring Mikrotik-Rate-Limit", zap.Error(err))
+			continue
+		}
+		authResp.UploadBPS, authResp.DownloadBPS = up, down
+	}
 }
 
 // waitRateLimit blocks until the per-server rate limiter allows a request,

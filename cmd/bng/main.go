@@ -77,12 +77,15 @@ var (
 	leaseTime   time.Duration
 
 	// RADIUS configuration
-	radiusServers    string
-	radiusSecret     string
-	radiusSecretFile string
-	radiusNASID      string
-	radiusTimeout    time.Duration
-	radiusEnabled    bool
+	radiusServers     string
+	radiusSecret      string
+	radiusSecretFile  string
+	radiusNASID       string
+	radiusTimeout     time.Duration
+	radiusEnabled     bool
+	radiusAcctInterim time.Duration
+	coaEnabled        bool
+	coaListen         string
 
 	// QoS configuration
 	qosBPFPath string
@@ -95,6 +98,7 @@ var (
 	natPortsPerSub int
 	natLogEnabled  bool
 	natLogPath     string
+	natMaxMappings int
 
 	// Advanced NAT44 configuration (Issue #67)
 	natInsideInterface  string // Inside interface for NAT (subscriber-facing)
@@ -234,6 +238,12 @@ func init() {
 		"RADIUS NAS-Identifier")
 	runCmd.Flags().DurationVar(&radiusTimeout, "radius-timeout", 3*time.Second,
 		"RADIUS request timeout")
+	runCmd.Flags().DurationVar(&radiusAcctInterim, "radius-acct-interim", 5*time.Minute,
+		"Default RADIUS Interim-Update interval for PPPoE sessions, used when Access-Accept has no Acct-Interim-Interval (0 = none)")
+	runCmd.Flags().BoolVar(&coaEnabled, "coa-enabled", false,
+		"Accept RADIUS CoA and Disconnect-Requests (RFC 5176) for PPPoE sessions, using the RADIUS secret")
+	runCmd.Flags().StringVar(&coaListen, "coa-listen", ":3799",
+		"Address for the RADIUS CoA/Disconnect listener")
 	runCmd.Flags().BoolVar(&radiusEnabled, "radius-enabled", false,
 		"Enable RADIUS authentication")
 
@@ -249,9 +259,11 @@ func init() {
 	runCmd.Flags().StringVar(&natBPFPath, "nat-bpf-path", "bpf/nat44.bpf.o",
 		"Path to compiled NAT44 eBPF program")
 	runCmd.Flags().StringVar(&natPublicIPs, "nat-public-ips", "",
-		"Public IP addresses for NAT pool (comma-separated)")
+		"Public IP addresses or prefixes for NAT pool (comma-separated)")
 	runCmd.Flags().IntVar(&natPortsPerSub, "nat-ports-per-sub", 1024,
 		"Number of ports allocated per subscriber")
+	runCmd.Flags().IntVar(&natMaxMappings, "nat-max-mappings", 1<<20,
+		"CGNAT mapping table size of the PPPoE XDP data plane (two preallocated tables of about 80 bytes an entry)")
 	runCmd.Flags().BoolVar(&natLogEnabled, "nat-log-enabled", false,
 		"Enable NAT translation logging (required for legal compliance)")
 	runCmd.Flags().StringVar(&natLogPath, "nat-log-path", "",
@@ -1004,6 +1016,7 @@ func runBNG(cmd *cobra.Command, args []string) error {
 
 	// Initialize policy manager with default policies
 	policyMgr = radius.NewPolicyManager()
+	policyMgr.LoadDefaultPolicies()
 	dhcpServer.SetPolicyManager(policyMgr)
 	logger.Info("QoS policy manager initialized",
 		zap.Int("policies", len(policyMgr.ListPolicies())),
@@ -1031,10 +1044,29 @@ func runBNG(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Initialize NAT manager if enabled
-	var natMgr *nat.Manager
+	// NAT logging (port block assignments) for legal compliance
 	var natLogger *nat.Logger
-	if natEnabled {
+	if natEnabled && natLogEnabled {
+		natLogger, err = nat.NewLogger(nat.LoggerConfig{
+			Enabled:     true,
+			FilePath:    natLogPath,
+			Format:      "json",
+			BulkLogging: natBulkLogging,
+		}, logger)
+		if err != nil {
+			logger.Warn("Failed to create NAT logger", zap.Error(err))
+		} else {
+			natLogger.Start()
+			logger.Info("NAT logging enabled",
+				zap.String("path", natLogPath),
+			)
+		}
+	}
+
+	// Initialize NAT manager if enabled. With the PPPoE XDP data plane,
+	// CGNAT runs inside that data plane instead (set up with it below).
+	var natMgr *nat.Manager
+	if natEnabled && pppoeXDPUplinks == "" {
 		natMgr, err = nat.NewManager(nat.ManagerConfig{
 			Interface:          iface,
 			BPFPath:            natBPFPath,
@@ -1069,29 +1101,14 @@ func runBNG(cmd *cobra.Command, args []string) error {
 				logger.Warn("Failed to start NAT manager", zap.Error(err))
 			} else {
 				dhcpServer.SetNATManager(natMgr)
+				if natLogger != nil {
+					natMgr.SetLogger(natLogger)
+				}
 				logger.Info("NAT44 manager started",
 					zap.String("interface", iface),
 					zap.Int("public_ips", len(natMgr.GetPoolStats())),
 					zap.Int("ports_per_sub", natPortsPerSub),
 				)
-			}
-
-			// Initialize NAT logging if enabled
-			if natLogEnabled {
-				natLogger, err = nat.NewLogger(nat.LoggerConfig{
-					Enabled:     true,
-					FilePath:    natLogPath,
-					Format:      "json",
-					BulkLogging: natBulkLogging,
-				}, logger)
-				if err != nil {
-					logger.Warn("Failed to create NAT logger", zap.Error(err))
-				} else {
-					natLogger.Start()
-					logger.Info("NAT logging enabled",
-						zap.String("path", natLogPath),
-					)
-				}
 			}
 		}
 	}
@@ -1126,6 +1143,8 @@ func runBNG(cmd *cobra.Command, args []string) error {
 			AuthType:       pppoeAuthType,
 			SessionTimeout: pppoeSessionTimeout,
 			MRU:            pppoeMRU,
+
+			AcctInterimInterval: radiusAcctInterim,
 		}, logger)
 		if err != nil {
 			logger.Warn("Failed to create PPPoE server", zap.Error(err))
@@ -1133,6 +1152,7 @@ func runBNG(cmd *cobra.Command, args []string) error {
 			if radiusClient != nil {
 				pppoeServer.SetRADIUSClient(radiusClient)
 			}
+			pppoeServer.SetPolicyManager(policyMgr)
 			if pppoeXDPUplinks != "" {
 				dp, err := setupPPPoEDataplane(loader, pppoeIface, iface, fastPathIface, fastPathVLAN, logger)
 				if err != nil {
@@ -1149,6 +1169,14 @@ func runBNG(cmd *cobra.Command, args []string) error {
 						logger.Warn("Failed to close PPPoE XDP data plane", zap.Error(err))
 					}
 				}()
+				if natEnabled {
+					cgnat, err := newPPPoECGNAT(dp.dp, natLogger, logger)
+					if err != nil {
+						return fmt.Errorf("failed to set up CGNAT: %w", err)
+					}
+					dp.nat = cgnat
+					go cgnat.sweepLoop(ctx)
+				}
 				pppoeServer.SetDataplane(dp)
 			}
 			logger.Info("PPPoE server configured",
@@ -1323,6 +1351,42 @@ func runBNG(cmd *cobra.Command, args []string) error {
 				zap.String("interface", iface),
 			)
 		}
+	}
+
+	// RADIUS CoA/Disconnect listener (RFC 5176); only PPPoE sessions are
+	// handled for now
+	if coaEnabled {
+		if resolvedRadiusSecret == "" {
+			return fmt.Errorf("--coa-enabled needs the RADIUS secret (--radius-secret-file)")
+		}
+		coaServer, err := radius.NewCoAServer(radius.CoAServerConfig{
+			Address: coaListen,
+			Secret:  resolvedRadiusSecret,
+		}, logger)
+		if err != nil {
+			return fmt.Errorf("failed to create RADIUS CoA server: %w", err)
+		}
+		coaServer.SetDisconnectHandler(func(_ context.Context, req *radius.DisconnectRequest) *radius.DisconnectResponse {
+			if pppoeServer == nil {
+				return &radius.DisconnectResponse{ErrorCause: radius.ErrorCauseSessionContextNotFound}
+			}
+			return pppoeServer.Disconnect(req)
+		})
+		coaServer.SetCoAHandler(func(_ context.Context, req *radius.CoARequest) *radius.CoAResponse {
+			if pppoeServer == nil {
+				return &radius.CoAResponse{ErrorCause: radius.ErrorCauseSessionContextNotFound}
+			}
+			return pppoeServer.ChangeAuthorization(req)
+		})
+		if err := coaServer.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start RADIUS CoA server: %w", err)
+		}
+		defer func() {
+			if err := coaServer.Stop(); err != nil {
+				logger.Warn("Failed to stop RADIUS CoA server", zap.Error(err))
+			}
+		}()
+		logger.Info("RADIUS CoA/Disconnect listener started", zap.String("address", coaListen))
 	}
 
 	// Start PPPoE server if enabled
@@ -1673,6 +1737,7 @@ type pppoeXDPDataplane struct {
 	vlan       uint16 // VLAN tag the XDP program sees on PPPoE frames
 	fibIfindex int    // PPPoE interface, used for route lookups
 	txIfindex  int    // Port the XDP fast path runs on
+	nat        *pppoeCGNAT
 }
 
 func (a *pppoeXDPDataplane) entry(s *pppoe.Session) ebpf.PPPoESession {
@@ -1690,15 +1755,158 @@ func (a *pppoeXDPDataplane) entry(s *pppoe.Session) ebpf.PPPoESession {
 		MRU:        mru,
 		FIBIfindex: a.fibIfindex,
 		TXIfindex:  a.txIfindex,
+
+		UpRateBPS:   s.UpRateBPS,
+		DownRateBPS: s.DownRateBPS,
 	}
 }
 
+func (a *pppoeXDPDataplane) SetRate(s *pppoe.Session, upBPS, downBPS uint64) error {
+	return a.dp.SetSessionRate(s.ClientIP, upBPS, downBPS)
+}
+
+func (a *pppoeXDPDataplane) Counters(s *pppoe.Session) (pppoe.Counters, error) {
+	c, err := a.dp.SessionCounters(s.ClientIP)
+	if err != nil {
+		return pppoe.Counters{}, err
+	}
+	return pppoe.Counters{
+		InPackets:  c.UpPackets,
+		InOctets:   c.UpBytes,
+		OutPackets: c.DownPackets,
+		OutOctets:  c.DownBytes,
+	}, nil
+}
+
 func (a *pppoeXDPDataplane) AddSession(s *pppoe.Session) error {
-	return a.dp.AddSession(a.entry(s))
+	// The port block goes in first, so no packet leaves untranslated
+	if a.nat != nil {
+		if err := a.nat.add(s); err != nil {
+			return err
+		}
+	}
+	if err := a.dp.AddSession(a.entry(s)); err != nil {
+		if a.nat != nil {
+			a.nat.remove(s)
+		}
+		return err
+	}
+	return nil
 }
 
 func (a *pppoeXDPDataplane) RemoveSession(s *pppoe.Session) error {
-	return a.dp.RemoveSession(a.entry(s))
+	err := a.dp.RemoveSession(a.entry(s))
+	if a.nat != nil {
+		a.nat.remove(s)
+	}
+	return err
+}
+
+// pppoeCGNAT gives PPPoE sessions with a private address a CGNAT port
+// block in the XDP data plane, logs the assignments and expires mappings
+type pppoeCGNAT struct {
+	dp     *ebpf.PPPoEDataplane
+	blocks *nat.BlockAllocator
+	log    *nat.Logger // nil = no NAT logging
+	logger *zap.Logger
+}
+
+func newPPPoECGNAT(dp *ebpf.PPPoEDataplane, natLog *nat.Logger, logger *zap.Logger) (*pppoeCGNAT, error) {
+	pub, err := nat.ParsePublicIPs(splitAndTrim(natPublicIPs))
+	if err != nil {
+		return nil, err
+	}
+	blocks, err := nat.NewBlockAllocator(pub, natPortsPerSub)
+	if err != nil {
+		return nil, err
+	}
+	for _, ip := range pub {
+		if err := dp.AddNATPublicIP(ip); err != nil {
+			return nil, err
+		}
+	}
+	_, total := blocks.Usage()
+	logger.Info("CGNAT enabled in the PPPoE XDP data plane",
+		zap.Int("public_ips", len(pub)),
+		zap.Uint16("ports_per_subscriber", blocks.BlockSize()),
+		zap.Int("port_blocks", total),
+		zap.Int("max_mappings", natMaxMappings),
+		zap.Bool("logging", natLog != nil),
+	)
+	return &pppoeCGNAT{dp: dp, blocks: blocks, log: natLog, logger: logger}, nil
+}
+
+func (n *pppoeCGNAT) add(s *pppoe.Session) error {
+	if !nat.IsPrivateIPv4(s.ClientIP) {
+		return nil
+	}
+	alloc, gen, err := n.blocks.Allocate(s.ClientIP, s.Username)
+	if err != nil {
+		return err
+	}
+	block := ebpf.PPPoENATBlock{
+		PublicIP:  alloc.PublicIP,
+		PortStart: alloc.PortStart,
+		PortCount: alloc.PortEnd - alloc.PortStart + 1,
+		Gen:       gen,
+	}
+	if err := n.dp.SetSubscriberNAT(s.ClientIP, block); err != nil {
+		n.blocks.Release(s.ClientIP)
+		return err
+	}
+	if n.log != nil {
+		n.log.LogAllocation(alloc)
+	}
+	n.logger.Info("CGNAT port block assigned",
+		zap.String("username", s.Username),
+		zap.String("private_ip", s.ClientIP.String()),
+		zap.String("public_ip", alloc.PublicIP.String()),
+		zap.Uint16("port_start", alloc.PortStart),
+		zap.Uint16("port_end", alloc.PortEnd),
+	)
+	return nil
+}
+
+func (n *pppoeCGNAT) remove(s *pppoe.Session) {
+	alloc := n.blocks.Release(s.ClientIP)
+	if alloc == nil {
+		return
+	}
+	if err := n.dp.DeleteSubscriberNAT(s.ClientIP); err != nil {
+		n.logger.Warn("Failed to remove CGNAT port block", zap.Error(err))
+	}
+	if n.log != nil {
+		n.log.LogRelease(alloc)
+	}
+}
+
+// sweepLoop removes idle and stale mappings
+func (n *pppoeCGNAT) sweepLoop(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			start := time.Now()
+			res, err := n.dp.ExpireNAT(ebpf.DefaultNATTimeouts)
+			if err != nil {
+				n.logger.Warn("CGNAT sweep failed", zap.Error(err))
+				continue
+			}
+			used, total := n.blocks.Usage()
+			n.logger.Debug("CGNAT sweep",
+				zap.Int("mappings", res.Active),
+				zap.Int("expired", res.Expired),
+				zap.Int("stale", res.Stale),
+				zap.Int("orphans", res.Orphans),
+				zap.Int("blocks_used", used),
+				zap.Int("blocks_total", total),
+				zap.Duration("took", time.Since(start)),
+			)
+		}
+	}
 }
 
 // setupPPPoEDataplane loads the PPPoE XDP data plane, hooks its upstream
@@ -1710,9 +1918,10 @@ func setupPPPoEDataplane(loader *ebpf.Loader, pppoeIface, dhcpIface, fastPathIfa
 	if pppoeIface != dhcpIface {
 		return nil, fmt.Errorf("--pppoe-interface %s must match --interface %s", pppoeIface, dhcpIface)
 	}
-	// XDP forwarding bypasses the TC hooks NAT44 and QoS rely on
-	if natEnabled || qosEnabled {
-		return nil, fmt.Errorf("cannot be combined with --nat-enabled or --qos-enabled")
+	// XDP forwarding bypasses the TC hooks QoS relies on (NAT is done in
+	// the PPPoE data plane itself)
+	if qosEnabled {
+		return nil, fmt.Errorf("cannot be combined with --qos-enabled")
 	}
 
 	pppoeLink, err := net.InterfaceByName(pppoeIface)
@@ -1724,7 +1933,7 @@ func setupPPPoEDataplane(loader *ebpf.Loader, pppoeIface, dhcpIface, fastPathIfa
 		return nil, err
 	}
 
-	dp, err := ebpf.NewPPPoEDataplane(pppoeBPFPath, logger)
+	dp, err := ebpf.NewPPPoEDataplane(pppoeBPFPath, ebpf.PPPoEDataplaneOptions{NATMappings: natMaxMappings}, logger)
 	if err != nil {
 		return nil, err
 	}
