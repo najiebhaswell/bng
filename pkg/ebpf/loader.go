@@ -15,6 +15,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 )
 
 // PoolAssignment represents a subscriber's pool assignment (mirrors eBPF struct)
@@ -23,7 +24,7 @@ type PoolAssignment struct {
 	AllocatedIP uint32 // Network byte order
 	VlanID      uint32 // Outer VLAN seen by the XDP program (0 = untagged); fast path answers only on it
 	ClientClass uint8
-	LeaseExpiry uint64 // Unix timestamp (seconds)
+	LeaseExpiry uint64 // CLOCK_MONOTONIC seconds (see LeaseExpiryAt); the fast path extends it on every ACK
 	Flags       uint8
 	_           [3]byte // Padding
 }
@@ -393,6 +394,24 @@ func (l *Loader) SetPPPoEProgram(prog *ebpf.Program) error {
 	return progs.Put(&key, prog)
 }
 
+// SetIPoEProgram installs the IPoE upstream program as the tail call for
+// IPv4 that is not a DHCP request (pppoe_progs slot 1). Passing nil removes
+// it.
+func (l *Loader) SetIPoEProgram(prog *ebpf.Program) error {
+	if l.collection == nil {
+		return fmt.Errorf("eBPF program not loaded")
+	}
+	progs := l.collection.Maps["pppoe_progs"]
+	if progs == nil {
+		return fmt.Errorf("pppoe_progs map not found in %s (rebuild the BPF objects)", l.bpfPath)
+	}
+	key := uint32(1)
+	if prog == nil {
+		return progs.Delete(&key)
+	}
+	return progs.Put(&key, prog)
+}
+
 // === Map Operations ===
 
 // AddSubscriber adds a subscriber to the fast path cache
@@ -751,7 +770,40 @@ func Uint64ToMAC(n uint64) net.HardwareAddr {
 	return mac
 }
 
-// LeaseExpiryFromDuration calculates lease expiry timestamp
+// MonotonicSeconds is the clock the XDP fast path keeps lease expiry in
+// (bpf_ktime_get_ns, CLOCK_MONOTONIC)
+func MonotonicSeconds() uint64 {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		return 0
+	}
+	return uint64(ts.Sec)
+}
+
+// LeaseExpiryFromDuration returns the lease expiry for a lease of d
+// starting now
 func LeaseExpiryFromDuration(d time.Duration) uint64 {
-	return uint64(time.Now().Add(d).Unix())
+	now := MonotonicSeconds()
+	if d < 0 {
+		if back := uint64(-d / time.Second); back < now {
+			return now - back
+		}
+		return 0
+	}
+	return now + uint64(d/time.Second)
+}
+
+// LeaseExpiryAt returns the lease expiry for a lease ending at t
+func LeaseExpiryAt(t time.Time) uint64 {
+	return LeaseExpiryFromDuration(time.Until(t))
+}
+
+// LeaseRemaining returns how long a lease with this expiry has left (0 if
+// it has expired)
+func LeaseRemaining(expiry uint64) time.Duration {
+	now := MonotonicSeconds()
+	if expiry <= now {
+		return 0
+	}
+	return time.Duration(expiry-now) * time.Second
 }

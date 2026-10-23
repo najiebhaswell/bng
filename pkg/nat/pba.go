@@ -130,6 +130,20 @@ func (a *BlockAllocator) Release(privateIP net.IP) *Allocation {
 	return o.alloc
 }
 
+// Lookup returns the block privateIP holds (nil if none)
+func (a *BlockAllocator) Lookup(privateIP net.IP) *Allocation {
+	priv := privateIP.To4()
+	if priv == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if o, ok := a.owners[[4]byte(priv)]; ok {
+		return o.alloc
+	}
+	return nil
+}
+
 // BlockSize returns the ports per block
 func (a *BlockAllocator) BlockSize() uint16 {
 	return a.blockSize

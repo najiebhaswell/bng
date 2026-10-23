@@ -37,6 +37,10 @@ type Dataplane interface {
 	SetRate(session *Session, upBPS, downBPS uint64) error
 	// Counters returns the traffic forwarded for an established session
 	Counters(session *Session) (Counters, error)
+	// AddIPv6 routes an established session's IPv6 prefixes (WANPrefix,
+	// PDPrefix) to it; RemoveIPv6 takes them away again
+	AddIPv6(session *Session) error
+	RemoveIPv6(session *Session) error
 }
 
 // Counters is a session's forwarded traffic; In is from the subscriber, as
@@ -103,6 +107,10 @@ type Server struct {
 	// Work run on the processing goroutine on behalf of other goroutines
 	// (CoA and Disconnect requests)
 	cmds chan func()
+
+	// Dual stack (optional)
+	ipv6           *IPv6
+	ipv6cpRejected uint64 // Peers that Protocol-Rejected IPv6CP
 
 	// Data plane for established sessions (optional)
 	dataplane Dataplane
@@ -359,7 +367,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Both sockets feed one processing goroutine, so session state and the
 	// IP pool are only ever touched from a single goroutine
-	frames := make(chan []byte, 256)
+	frames := make(chan []byte, 8192)
 	go s.receiveLoop(ctx, s.socket, frames)
 	go s.receiveLoop(ctx, s.sessionSocket, frames)
 	go s.processLoop(ctx, frames)
@@ -443,6 +451,7 @@ func (s *Server) processLoop(ctx context.Context, frames <-chan []byte) {
 // requests we originate are covered; the peer retransmits its own.
 func (s *Server) retransmit(now time.Time) {
 	for _, session := range s.sessions.GetAllSessions() {
+		s.retransmitIPv6CP(session, now)
 		if now.Sub(session.negSentAt) < restartInterval {
 			continue
 		}
@@ -483,7 +492,7 @@ func (s *Server) handleFrame(frame []byte) {
 	etherType := binary.BigEndian.Uint16(frame[12:14])
 
 	// Check if it's for us (broadcast or our MAC)
-	if !isBroadcastMAC(dstMAC) && dstMAC.String() != s.serverMAC.String() {
+	if !isBroadcastMAC(dstMAC) && !bytes.Equal(dstMAC, s.serverMAC) {
 		return
 	}
 
@@ -711,6 +720,10 @@ func (s *Server) handleSession(clientMAC net.HardwareAddr, data []byte) {
 		s.handleIPCP(session, pppPayload)
 	case ProtocolIP:
 		s.handleIPPacket(session, pppPayload)
+	case ProtocolIPv6CP:
+		s.handleIPv6CP(session, pppPayload)
+	case ProtocolIPv6:
+		s.handleIPv6Packet(session, pppPayload)
 	}
 }
 
@@ -766,6 +779,22 @@ func (s *Server) handleLCP(session *Session, data []byte) {
 		s.handleLCPEchoRequest(session, pkt)
 	case LCPCodeTermRequest:
 		s.handleLCPTermRequest(session, pkt)
+	case LCPCodeProtoReject:
+		s.handleLCPProtocolReject(session, pkt)
+	}
+}
+
+// handleLCPProtocolReject stops sending a protocol the peer does not
+// support (RFC 1661 5.7). Only IPv6CP is ever rejected in practice: a peer
+// without IPv6 keeps the session IPv4-only.
+func (s *Server) handleLCPProtocolReject(session *Session, pkt *LCPPacket) {
+	if len(pkt.Data) < 2 {
+		return
+	}
+	if binary.BigEndian.Uint16(pkt.Data) == ProtocolIPv6CP && session.ipv6cpStarted {
+		session.ipv6cpStarted = false
+		atomic.AddUint64(&s.ipv6cpRejected, 1)
+		s.logger.Debug("Peer rejected IPv6CP, session stays IPv4-only", zap.Uint16("session_id", session.ID))
 	}
 }
 
@@ -921,6 +950,7 @@ func (s *Server) endSession(session *Session, cause uint32) {
 		s.sendAccounting(session, radius.AcctStatusStop, cause, nil)
 		session.acctStarted = false
 	}
+	s.ipv6Down(session)
 	if s.dataplane != nil && session.IsEstablished() {
 		if err := s.dataplane.RemoveSession(session); err != nil {
 			s.logger.Warn("Failed to remove PPPoE session from data plane",
@@ -1215,6 +1245,7 @@ func (s *Server) startIPCPNegotiation(session *Session) {
 
 	session.negRetries = 0
 	s.sendIPCPConfigRequest(session)
+	s.startIPv6CP(session)
 }
 
 // sendIPCPConfigRequest sends our IPCP Configure-Request
@@ -1346,6 +1377,8 @@ func (s *Server) handleIPCPConfigAck(session *Session, pkt *LCPPacket) {
 		session.acctStarted = true
 		s.sendAccounting(session, radius.AcctStatusStart, 0, &Counters{})
 	}
+	// IPv6CP may have finished first
+	s.maybeIPv6Up(session)
 }
 
 // handleIPPacket handles encapsulated IP packets
@@ -1434,7 +1467,18 @@ func (s *Server) GetStats() map[string]uint64 {
 		"padt_sent":       atomic.LoadUint64(&s.padtSent),
 		"sessions_total":  atomic.LoadUint64(&s.sessionsTotal),
 		"sessions_active": uint64(s.sessions.Count()),
+		"ipv6cp_rejected": atomic.LoadUint64(&s.ipv6cpRejected),
+		"socket_drops":    socketDrops(s.socket) + socketDrops(s.sessionSocket),
 	}
+}
+
+// socketDrops returns the frames a socket dropped, where the platform
+// tells
+func socketDrops(sock rawSocket) uint64 {
+	if d, ok := sock.(interface{ drops() uint64 }); ok {
+		return d.drops()
+	}
+	return 0
 }
 
 // Helper functions

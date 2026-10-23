@@ -48,6 +48,9 @@ type Server struct {
 	// NAT integration (optional)
 	natMgr *nat.Manager
 
+	// Data plane forwarding leased subscribers (optional)
+	dataplane LeaseDataplane
+
 	// Nexus integration (optional) - for centralized IP allocation
 	nexusClient *nexus.Client
 
@@ -95,8 +98,12 @@ type Lease struct {
 	SessionStart time.Time // Session start time
 	Class        []byte    // RADIUS Class attribute
 	PolicyName   string    // QoS policy applied
-	InputBytes   uint64    // Upload bytes
-	OutputBytes  uint64    // Download bytes
+
+	// IPv6 prefixes from RADIUS (Framed-IPv6-Prefix, Delegated-IPv6-Prefix)
+	FramedIPv6Prefix    *net.IPNet
+	DelegatedIPv6Prefix *net.IPNet
+	InputBytes          uint64 // Upload bytes
+	OutputBytes         uint64 // Download bytes
 
 	// QinQ VLAN context (for European PoI deployments)
 	STag uint16 // Service VLAN (outer, 802.1ad)
@@ -119,6 +126,14 @@ type ServerConfig struct {
 	ServerIP          net.IP
 	RADIUSAuthEnabled bool
 	FastPathVLAN      uint16 // Outer VLAN the XDP fast path sees (0 = untagged)
+}
+
+// LeaseDataplane forwards the traffic of leased subscribers, e.g. the XDP
+// subscriber data plane. AddLease is called once per new session, before
+// the ACK; RemoveLease when the lease is released, declined or expires.
+type LeaseDataplane interface {
+	AddLease(lease *Lease) error
+	RemoveLease(lease *Lease)
 }
 
 // NewServer creates a new DHCP slow path server
@@ -161,6 +176,11 @@ func (s *Server) SetQoSManager(qm *qos.Manager) {
 // SetNATManager sets the NAT manager for CGNAT
 func (s *Server) SetNATManager(nm *nat.Manager) {
 	s.natMgr = nm
+}
+
+// SetDataplane sets the data plane that forwards leased subscribers
+func (s *Server) SetDataplane(dp LeaseDataplane) {
+	s.dataplane = dp
 }
 
 // SetNexusClient sets the Nexus client for centralized IP allocation.
@@ -683,6 +703,8 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
 		if authResp != nil {
 			lease.Class = authResp.Class
 			lease.PolicyName = authResp.FilterID
+			lease.FramedIPv6Prefix = authResp.FramedIPv6Prefix
+			lease.DelegatedIPv6Prefix = authResp.DelegatedIPv6Prefix
 		}
 	} else {
 		// Preserve existing session data
@@ -690,12 +712,28 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
 		lease.SessionStart = existingLease.SessionStart
 		lease.Class = existingLease.Class
 		lease.PolicyName = existingLease.PolicyName
+		lease.FramedIPv6Prefix = existingLease.FramedIPv6Prefix
+		lease.DelegatedIPv6Prefix = existingLease.DelegatedIPv6Prefix
 		lease.InputBytes = existingLease.InputBytes
 		lease.OutputBytes = existingLease.OutputBytes
 		// Preserve Option 82 if not present in current request
 		if lease.CircuitID == nil && existingLease.CircuitID != nil {
 			lease.CircuitID = existingLease.CircuitID
 			lease.RemoteID = existingLease.RemoteID
+		}
+	}
+
+	// A new subscriber the data plane cannot take (e.g. no CGNAT port
+	// block left) gets no lease
+	if isNewSession && s.dataplane != nil {
+		if err := s.dataplane.AddLease(lease); err != nil {
+			s.logger.Error("Failed to add subscriber to the data plane",
+				zap.String("mac", mac.String()),
+				zap.String("ip", requestedIP.String()),
+				zap.Error(err),
+			)
+			atomic.AddUint64(&s.naksTotal, 1)
+			return s.buildNAK(req, "no resources")
 		}
 	}
 
@@ -758,7 +796,7 @@ func (s *Server) handleRequest(req *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, error) {
 				AllocatedIP: ebpf.IPToUint32(lease.IP),
 				VlanID:      uint32(s.fastPathVLAN),
 				ClientClass: uint8(pool.ClientClass),
-				LeaseExpiry: uint64(lease.ExpiresAt.Unix()),
+				LeaseExpiry: ebpf.LeaseExpiryAt(lease.ExpiresAt),
 				Flags:       0,
 			}
 			if err := s.loader.AddCircuitIDSubscriber(lease.CircuitID, assignment); err != nil {
@@ -878,107 +916,8 @@ func (s *Server) handleRelease(req *dhcpv4.DHCPv4) {
 	}
 	s.leasesMu.Unlock()
 
-	// Remove from circuit-ID secondary index
-	if exists && len(lease.CircuitID) > 0 {
-		cidKey := hex.EncodeToString(lease.CircuitID)
-		s.leasesByCircuitIDMu.Lock()
-		delete(s.leasesByCircuitID, cidKey)
-		s.leasesByCircuitIDMu.Unlock()
-	}
-
 	if exists {
-		// Send RADIUS Accounting-Stop
-		if s.radiusClient != nil && lease.SessionID != "" {
-			sessionTime := uint32(time.Since(lease.SessionStart).Seconds())
-			go func() {
-				err := s.radiusClient.SendAccounting(context.Background(), &radius.AcctRequest{
-					SessionID:      lease.SessionID,
-					Username:       mac.String(),
-					MAC:            mac,
-					FramedIP:       lease.IP,
-					StatusType:     radius.AcctStatusStop,
-					InputOctets:    lease.InputBytes,
-					OutputOctets:   lease.OutputBytes,
-					SessionTime:    sessionTime,
-					TerminateCause: radius.TerminateCauseUserRequest,
-					Class:          lease.Class,
-				})
-				if err != nil {
-					s.logger.Warn("Failed to send RADIUS Accounting-Stop",
-						zap.String("session_id", lease.SessionID),
-						zap.Error(err),
-					)
-				}
-			}()
-		}
-
-		// Remove QoS policy
-		if s.qosMgr != nil {
-			if err := s.qosMgr.RemoveSubscriberQoS(lease.IP); err != nil {
-				s.logger.Warn("Failed to remove QoS policy",
-					zap.String("ip", lease.IP.String()),
-					zap.Error(err),
-				)
-			}
-		}
-
-		// Deallocate NAT
-		if s.natMgr != nil {
-			if err := s.natMgr.DeallocateNAT(lease.IP); err != nil {
-				s.logger.Warn("Failed to deallocate NAT",
-					zap.String("ip", lease.IP.String()),
-					zap.Error(err),
-				)
-			}
-		}
-
-		// Release IP back to pool
-		if pool := s.poolMgr.GetPool(lease.PoolID); pool != nil {
-			pool.Release(lease.IP)
-		}
-
-		// Remove from fast path cache (MAC-based)
-		macU64 := ebpf.MACToUint64(mac)
-		if err := s.loader.RemoveSubscriber(macU64); err != nil {
-			s.logger.Warn("Failed to remove from fast path cache",
-				zap.String("mac", mac.String()),
-				zap.Error(err),
-			)
-		}
-
-		// Remove from VLAN-based cache for QinQ deployments
-		if (lease.STag > 0 || lease.CTag > 0) && s.loader.HasVLANSupport() {
-			if err := s.loader.RemoveVLANSubscriber(lease.STag, lease.CTag); err != nil {
-				s.logger.Warn("Failed to remove from VLAN fast path cache",
-					zap.Uint16("s_tag", lease.STag),
-					zap.Uint16("c_tag", lease.CTag),
-					zap.Error(err),
-				)
-			}
-		}
-
-		// Issue #15: Remove circuit-id to MAC mapping if present
-		if len(lease.CircuitID) > 0 {
-			if err := s.loader.RemoveCircuitIDMapping(lease.CircuitID); err != nil {
-				s.logger.Warn("Failed to remove circuit-id to MAC mapping",
-					zap.String("mac", mac.String()),
-					zap.String("circuit_id", string(lease.CircuitID)),
-					zap.Error(err),
-				)
-			}
-
-			// Issue #56: Remove circuit-id subscriber mapping
-			if s.loader.HasCircuitIDSubscriberSupport() {
-				if err := s.loader.RemoveCircuitIDSubscriber(lease.CircuitID); err != nil {
-					s.logger.Warn("Failed to remove circuit-id subscriber mapping",
-						zap.String("mac", mac.String()),
-						zap.String("circuit_id", string(lease.CircuitID)),
-						zap.Error(err),
-					)
-				}
-			}
-		}
-
+		s.removeLease(lease, radius.TerminateCauseUserRequest, true)
 		s.logger.Info("DHCP RELEASE processed",
 			zap.String("mac", mac.String()),
 			zap.String("ip", lease.IP.String()),
@@ -987,6 +926,125 @@ func (s *Server) handleRelease(req *dhcpv4.DHCPv4) {
 	}
 
 	atomic.AddUint64(&s.releasesTotal, 1)
+}
+
+// removeLease tears down a lease already taken out of s.leases: accounting
+// stop, QoS, NAT, data plane, the address (if releaseIP) and the fast path
+// caches
+func (s *Server) removeLease(lease *Lease, cause uint32, releaseIP bool) {
+	mac := lease.MAC
+
+	// Remove from circuit-ID secondary index
+	if len(lease.CircuitID) > 0 {
+		cidKey := hex.EncodeToString(lease.CircuitID)
+		s.leasesByCircuitIDMu.Lock()
+		if s.leasesByCircuitID[cidKey] == lease {
+			delete(s.leasesByCircuitID, cidKey)
+		}
+		s.leasesByCircuitIDMu.Unlock()
+	}
+
+	if s.dataplane != nil {
+		s.dataplane.RemoveLease(lease)
+	}
+
+	// Send RADIUS Accounting-Stop
+	if s.radiusClient != nil && lease.SessionID != "" {
+		sessionTime := uint32(time.Since(lease.SessionStart).Seconds())
+		go func() {
+			err := s.radiusClient.SendAccounting(context.Background(), &radius.AcctRequest{
+				SessionID:      lease.SessionID,
+				Username:       mac.String(),
+				MAC:            mac,
+				FramedIP:       lease.IP,
+				StatusType:     radius.AcctStatusStop,
+				InputOctets:    lease.InputBytes,
+				OutputOctets:   lease.OutputBytes,
+				SessionTime:    sessionTime,
+				TerminateCause: cause,
+				Class:          lease.Class,
+			})
+			if err != nil {
+				s.logger.Warn("Failed to send RADIUS Accounting-Stop",
+					zap.String("session_id", lease.SessionID),
+					zap.Error(err),
+				)
+			}
+		}()
+	}
+
+	// Remove QoS policy
+	if s.qosMgr != nil {
+		if err := s.qosMgr.RemoveSubscriberQoS(lease.IP); err != nil {
+			s.logger.Warn("Failed to remove QoS policy",
+				zap.String("ip", lease.IP.String()),
+				zap.Error(err),
+			)
+		}
+	}
+
+	// Deallocate NAT
+	if s.natMgr != nil {
+		if err := s.natMgr.DeallocateNAT(lease.IP); err != nil {
+			s.logger.Warn("Failed to deallocate NAT",
+				zap.String("ip", lease.IP.String()),
+				zap.Error(err),
+			)
+		}
+	}
+
+	// Release IP back to pool
+	if releaseIP {
+		if pool := s.poolMgr.GetPool(lease.PoolID); pool != nil {
+			pool.Release(lease.IP)
+		}
+	}
+
+	if s.loader == nil {
+		return
+	}
+
+	// Remove from fast path cache (MAC-based)
+	macU64 := ebpf.MACToUint64(mac)
+	if err := s.loader.RemoveSubscriber(macU64); err != nil {
+		s.logger.Warn("Failed to remove from fast path cache",
+			zap.String("mac", mac.String()),
+			zap.Error(err),
+		)
+	}
+
+	// Remove from VLAN-based cache for QinQ deployments
+	if (lease.STag > 0 || lease.CTag > 0) && s.loader.HasVLANSupport() {
+		if err := s.loader.RemoveVLANSubscriber(lease.STag, lease.CTag); err != nil {
+			s.logger.Warn("Failed to remove from VLAN fast path cache",
+				zap.Uint16("s_tag", lease.STag),
+				zap.Uint16("c_tag", lease.CTag),
+				zap.Error(err),
+			)
+		}
+	}
+
+	// Issue #15: Remove circuit-id to MAC mapping if present
+	if len(lease.CircuitID) > 0 {
+		if err := s.loader.RemoveCircuitIDMapping(lease.CircuitID); err != nil {
+			s.logger.Warn("Failed to remove circuit-id to MAC mapping",
+				zap.String("mac", mac.String()),
+				zap.String("circuit_id", string(lease.CircuitID)),
+				zap.Error(err),
+			)
+		}
+
+		// Issue #56: Remove circuit-id subscriber mapping
+		if s.loader.HasCircuitIDSubscriberSupport() {
+			if err := s.loader.RemoveCircuitIDSubscriber(lease.CircuitID); err != nil {
+				s.logger.Warn("Failed to remove circuit-id subscriber mapping",
+					zap.String("mac", mac.String()),
+					zap.String("circuit_id", string(lease.CircuitID)),
+					zap.Error(err),
+				)
+			}
+		}
+	}
 }
 
 // handleDecline handles DHCP DECLINE
@@ -1008,6 +1066,7 @@ func (s *Server) handleDecline(req *dhcpv4.DHCPv4) {
 	s.leasesMu.Unlock()
 
 	if exists && lease != nil {
+		s.removeLease(lease, radius.TerminateCauseUserError, false)
 		if pool := s.poolMgr.GetPool(lease.PoolID); pool != nil {
 			pool.MarkUnavailable(declinedIP)
 		}
@@ -1071,7 +1130,7 @@ func (s *Server) updateFastPathCache(mac net.HardwareAddr, lease *Lease, pool *P
 		AllocatedIP: ebpf.IPToUint32(lease.IP),
 		VlanID:      uint32(s.fastPathVLAN),
 		ClientClass: uint8(pool.ClientClass),
-		LeaseExpiry: uint64(lease.ExpiresAt.Unix()),
+		LeaseExpiry: ebpf.LeaseExpiryAt(lease.ExpiresAt),
 		Flags:       0,
 	}
 
@@ -1118,55 +1177,57 @@ func (s *Server) leaseCleanup(ctx context.Context) {
 	}
 }
 
-// cleanupExpiredLeases removes expired leases
+// cleanupExpiredLeases removes expired leases. Renewals answered by the
+// XDP fast path never reach this server, so a lease is only expired once
+// the fast path cache has not extended it either.
 func (s *Server) cleanupExpiredLeases() {
 	now := time.Now()
-	var expired []string
+	var expired []*Lease
 
-	s.leasesMu.RLock()
+	s.leasesMu.Lock()
 	for mac, lease := range s.leases {
-		if now.After(lease.ExpiresAt) {
-			expired = append(expired, mac)
+		if !now.After(lease.ExpiresAt) {
+			continue
 		}
+		if left := s.fastPathLeaseLeft(lease); left > 0 {
+			lease.ExpiresAt = now.Add(left)
+			continue
+		}
+		delete(s.leases, mac)
+		expired = append(expired, lease)
 	}
-	s.leasesMu.RUnlock()
+	s.leasesMu.Unlock()
 
 	if len(expired) == 0 {
 		return
 	}
-
-	s.leasesMu.Lock()
-	for _, mac := range expired {
-		lease := s.leases[mac]
-		delete(s.leases, mac)
-
-		// Remove from circuit-ID secondary index
-		if len(lease.CircuitID) > 0 {
-			cidKey := hex.EncodeToString(lease.CircuitID)
-			s.leasesByCircuitIDMu.Lock()
-			delete(s.leasesByCircuitID, cidKey)
-			s.leasesByCircuitIDMu.Unlock()
-		}
-
-		// Release IP back to pool
-		if pool := s.poolMgr.GetPool(lease.PoolID); pool != nil {
-			pool.Release(lease.IP)
-		}
-
-		// Remove from fast path cache
-		if s.loader != nil {
-			hwAddr, _ := net.ParseMAC(mac)
-			if hwAddr != nil {
-				macU64 := ebpf.MACToUint64(hwAddr)
-				s.loader.RemoveSubscriber(macU64)
-			}
-		}
+	for _, lease := range expired {
+		s.removeLease(lease, radius.TerminateCauseLostCarrier, true)
 	}
-	s.leasesMu.Unlock()
 
 	s.logger.Info("Cleaned up expired leases",
 		zap.Int("count", len(expired)),
 	)
+}
+
+// fastPathLeaseLeft returns how long the fast path cache still holds a
+// lease (it extends the expiry on every ACK it sends)
+func (s *Server) fastPathLeaseLeft(lease *Lease) time.Duration {
+	if s.loader == nil {
+		return 0
+	}
+	var left time.Duration
+	if a, err := s.loader.GetSubscriber(ebpf.MACToUint64(lease.MAC)); err == nil {
+		left = ebpf.LeaseRemaining(a.LeaseExpiry)
+	}
+	if len(lease.CircuitID) > 0 && s.loader.HasCircuitIDSubscriberSupport() {
+		if a, err := s.loader.GetCircuitIDSubscriber(lease.CircuitID); err == nil {
+			if l := ebpf.LeaseRemaining(a.LeaseExpiry); l > left {
+				left = l
+			}
+		}
+	}
+	return left
 }
 
 // Stats returns DHCP server statistics

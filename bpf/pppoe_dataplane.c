@@ -14,8 +14,18 @@
  * pppoe_downstream: attached to uplink ports. IPv4 addressed to a session is
  * encapsulated in PPPoE (+ 802.1Q tag) and redirected to the access port.
  *
- * Sessions with a CGNAT port block (nat_subs) are translated on the way:
+ * ipoe_upstream: tail-called from dhcp_fastpath_prog for IPv4 that is not a
+ * DHCP request. IPoE subscribers (DHCP leases) are forwarded like PPPoE
+ * sessions, minus the PPPoE header; pppoe_downstream handles both.
+ *
+ * Subscribers with a CGNAT port block (nat_subs) are translated on the way:
  * see the CGNAT section below.
+ *
+ * IPv6 (dual stack) follows the same paths. A subscriber owns prefixes
+ * (WAN /64, delegated prefix) in sub6, which checks their source address
+ * upstream and finds them downstream; IPv6 control traffic (link-local or
+ * multicast: RS, DHCPv6, ND) goes to userspace unchanged. Counters and rate
+ * limits are shared with the subscriber's IPv4.
  *
  * Supports untagged and single-tagged (802.1Q / 802.1ad) access ports.
  * QinQ and uplink-side VLANs are left to the kernel.
@@ -24,6 +34,7 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/in.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -34,12 +45,16 @@
 #ifndef AF_INET
 #define AF_INET 2
 #endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
 #define NSEC_PER_SEC 1000000000ULL
 
 #define ETH_P_8021Q   0x8100
 #define ETH_P_8021AD  0x88A8
 #define ETH_P_PPP_SES 0x8864
 #define PPP_IP        0x0021
+#define PPP_IPV6      0x0057
 
 #define VLAN_VID_MASK 0x0FFF
 #define MAX_PPPOE_SESSIONS 65536
@@ -89,9 +104,12 @@ struct pppoe_down_val {
 	__be16 session_id;
 	__u16  vlan_id;      /* 0 = untagged */
 	__u32  tx_ifindex;   /* access port */
-	__u16  mru;          /* peer MRU: largest PPP payload the client accepts */
-	__u16  _pad;
+	__u16  mru;          /* peer MRU: largest PPP payload the client accepts
+	                      * (IPoE: the access MTU) */
+	__u16  flags;        /* DOWN_F_* */
 };
+
+#define DOWN_F_IPOE 0x0001   /* IPoE subscriber: Ethernet (+ VLAN), no PPPoE */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -99,6 +117,69 @@ struct {
 	__type(key, __be32);
 	__type(value, struct pppoe_down_val);
 } pppoe_down SEC(".maps");
+
+/* Data plane settings (single entry, set by userspace) */
+#define DP_F_IPOE_LEASE_ONLY 0x0001  /* IPv4 from hosts without a lease only
+                                      * reaches nat_bypass destinations */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} dp_flags SEC(".maps");
+
+static __always_inline int dp_flag(__u32 flag)
+{
+	__u32 key = 0;
+	__u32 *v = bpf_map_lookup_elem(&dp_flags, &key);
+	return v && (*v & flag);
+}
+
+/* IPoE upstream: (client MAC, VLAN) -> subscriber; reuses pppoe_up_val */
+struct ipoe_up_key {
+	__u8  client_mac[ETH_ALEN];
+	__u16 vlan_id;       /* outer VLAN ID on the access port, 0 = untagged */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PPPOE_SESSIONS);
+	__type(key, struct ipoe_up_key);
+	__type(value, struct pppoe_up_val);
+} ipoe_up SEC(".maps");
+
+/* IPv6 prefixes of subscribers -> their IPv4 address (the key of
+ * pppoe_down, pppoe_policy and pppoe_sess_stats) */
+struct sub6_key {
+	__u32 prefixlen;
+	__u8  addr[16];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(max_entries, 2 * MAX_PPPOE_SESSIONS);
+	__type(key, struct sub6_key);
+	__type(value, __be32);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} sub6 SEC(".maps");
+
+static __always_inline __be32 *sub6_owner(const struct in6_addr *addr)
+{
+	struct sub6_key k = { .prefixlen = 128 };
+	__builtin_memcpy(k.addr, addr, 16);
+	return bpf_map_lookup_elem(&sub6, &k);
+}
+
+/* Link-local or multicast destination, or link-local source: for the
+ * BNG's control plane (RS, DHCPv6, ND), not to be forwarded */
+static __always_inline int ipv6_is_control(const struct ipv6hdr *ip6)
+{
+	const __u8 *d = ip6->daddr.in6_u.u6_addr8;
+	const __u8 *s = ip6->saddr.in6_u.u6_addr8;
+	return d[0] == 0xff || (d[0] == 0xfe && (d[1] & 0xc0) == 0x80) ||
+	       (s[0] == 0xfe && (s[1] & 0xc0) == 0x80);
+}
 
 /* Per-session rate limits (RADIUS / CoA): client IPv4 -> policy.
  * Rates are bytes per second, 0 = unlimited. Only userspace writes this
@@ -172,6 +253,18 @@ enum {
 	PPPOE_STAT_NAT_UNSUPPORTED,  /* IP options, protocol or ICMP type not translated, dropped */
 	PPPOE_STAT_NAT_FRAG_MISS,    /* fragment ahead of its first fragment, dropped */
 	PPPOE_STAT_NAT_ICMP_ERROR,   /* ICMP errors translated (counted in nat_in too) */
+	PPPOE_STAT_IPOE_UP_REDIRECT, /* IPoE, redirected to an uplink */
+	PPPOE_STAT_IPOE_UP_KERNEL,   /* IPoE, passed to the kernel */
+	PPPOE_STAT_IPOE_UP_NO_SESSION, /* IPoE from an unknown MAC/VLAN, passed to the kernel */
+	PPPOE_STAT_IPOE_UP_SPOOFED,  /* IPoE with a wrong source address, dropped */
+	PPPOE_STAT_IPOE_DOWN_REDIRECT, /* to an IPoE subscriber, redirected to access */
+	PPPOE_STAT_IPOE_UP_UNLEASED, /* IPoE without a lease to a forwarded destination, dropped */
+	PPPOE_STAT_UP6_REDIRECT,     /* IPv6 from a subscriber, redirected to an uplink */
+	PPPOE_STAT_UP6_KERNEL,       /* IPv6 from a subscriber, passed to the kernel */
+	PPPOE_STAT_UP6_CONTROL,      /* IPv6 control (link-local/multicast), to userspace */
+	PPPOE_STAT_UP6_SPOOFED,      /* IPv6 from outside the subscriber's prefixes, dropped */
+	PPPOE_STAT_DOWN6_REDIRECT,   /* IPv6 to a subscriber, redirected to access */
+	PPPOE_STAT_DOWN6_TOO_BIG,    /* IPv6 larger than the peer MRU/MTU, dropped */
 	PPPOE_STAT_MAX,
 };
 
@@ -342,6 +435,27 @@ struct {
 	__type(key, __be32);
 	__type(value, __u32);
 } nat_pool_ips SEC(".maps");
+
+/* Destinations reached without translation: the subscribers' own pools
+ * (gateway, other subscribers) and whatever else userspace adds */
+struct nat_bypass_key {
+	__u32  prefixlen;
+	__be32 addr;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(max_entries, 256);
+	__type(key, struct nat_bypass_key);
+	__type(value, __u8);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} nat_bypass SEC(".maps");
+
+static __always_inline int nat_bypassed(__be32 daddr)
+{
+	struct nat_bypass_key k = { .prefixlen = 32, .addr = daddr };
+	return bpf_map_lookup_elem(&nat_bypass, &k) != NULL;
+}
 
 /* Fragments after the first carry no ports: they follow the address the
  * first fragment was translated to. dir 0 = upstream, 1 = downstream. */
@@ -807,6 +921,166 @@ static __always_inline int nat_downstream(struct xdp_md *ctx, const __u32 ip_off
 }
 
 /* ========================================================================
+ * Forwarding from subscribers (PPPoE and IPoE)
+ * ======================================================================== */
+
+/* CGNAT and FIB forwarding of an IPv4 packet from a subscriber, whose IPv4
+ * header is at ip_off (a compile-time constant at each call site). Returns
+ * XDP_REDIRECT or XDP_DROP, or -1 when the kernel has to forward it; the
+ * packet may have been translated by then, and the caller must re-read its
+ * packet pointers. Packets about to expire go to the kernel untranslated,
+ * for the ICMP Time Exceeded to reach the subscriber. */
+static __always_inline int subscriber_forward(struct xdp_md *ctx, const __u32 ip_off,
+                                              __be32 client_ip, __u32 fib_ifindex)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct iphdr *ip = data + ip_off;
+	if ((void *)(ip + 1) > data_end)
+		return XDP_DROP;
+	if (ip->ttl <= 1)
+		return -1;
+
+	struct nat_sub *ns = bpf_map_lookup_elem(&nat_subs, &client_ip);
+	if (ns && !nat_bypassed(ip->daddr)) {
+		if (nat_upstream(ctx, ip_off, ns))
+			return XDP_DROP;
+		data = (void *)(long)ctx->data;
+		data_end = (void *)(long)ctx->data_end;
+		ip = data + ip_off;
+		if ((void *)(ip + 1) > data_end)
+			return XDP_DROP;
+	}
+
+	/* Fast forwarding: route lookup in the kernel FIB */
+	struct bpf_fib_lookup fib = {
+		.family = AF_INET,
+		.tos = ip->tos,
+		.l4_protocol = ip->protocol,
+		.tot_len = bpf_ntohs(ip->tot_len),
+		.ipv4_src = ip->saddr,
+		.ipv4_dst = ip->daddr,
+		.ifindex = fib_ifindex,
+	};
+	if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS ||
+	    !bpf_map_lookup_elem(&pppoe_tx_ports, &fib.ifindex))
+		return -1;
+
+	ip_decrease_ttl(ip);
+
+	/* Drop the access L2 (+ PPPoE) and write a fresh Ethernet header */
+	if (ip_off > sizeof(struct ethhdr) &&
+	    bpf_xdp_adjust_head(ctx, (int)(ip_off - sizeof(struct ethhdr))))
+		return XDP_DROP;
+	data = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return XDP_DROP;
+	__builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
+	eth->h_proto = bpf_htons(ETH_P_IP);
+	return bpf_redirect(fib.ifindex, 0);
+}
+
+/* FIB forwarding of an IPv6 packet from a subscriber, header at ip_off.
+ * Same contract as subscriber_forward. */
+static __always_inline int subscriber_forward6(struct xdp_md *ctx, const __u32 ip_off, __u32 fib_ifindex)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ipv6hdr *ip6 = data + ip_off;
+	if ((void *)(ip6 + 1) > data_end)
+		return XDP_DROP;
+	if (ip6->hop_limit <= 1)
+		return -1;
+
+	struct bpf_fib_lookup fib = {
+		.family = AF_INET6,
+		.l4_protocol = ip6->nexthdr,
+		.tot_len = bpf_ntohs(ip6->payload_len) + sizeof(struct ipv6hdr),
+		.ifindex = fib_ifindex,
+	};
+	fib.flowinfo = *(__be32 *)ip6 & bpf_htonl(0x0FFFFFFF);
+	__builtin_memcpy(fib.ipv6_src, &ip6->saddr, 16);
+	__builtin_memcpy(fib.ipv6_dst, &ip6->daddr, 16);
+	if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS ||
+	    !bpf_map_lookup_elem(&pppoe_tx_ports, &fib.ifindex))
+		return -1;
+
+	ip6->hop_limit--;
+
+	if (ip_off > sizeof(struct ethhdr) &&
+	    bpf_xdp_adjust_head(ctx, (int)(ip_off - sizeof(struct ethhdr))))
+		return XDP_DROP;
+	data = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) > data_end)
+		return XDP_DROP;
+	__builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
+	eth->h_proto = bpf_htons(ETH_P_IPV6);
+	return bpf_redirect(fib.ifindex, 0);
+}
+
+/* Hands a PPPoE session frame to the kernel as plain IP: the Ethernet (+
+ * VLAN) header stays, the PPPoE/PPP header goes and the EtherType becomes
+ * ethertype. The frame then arrives on the VLAN subinterface. */
+static __always_inline int pppoe_to_kernel(struct xdp_md *ctx, const __u32 l2_len, __u16 ethertype)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	__u8 l2[sizeof(struct ethhdr) + sizeof(struct vlan_hdr)];
+	if (data + l2_len > data_end)
+		return XDP_PASS;
+	__builtin_memcpy(l2, data, l2_len);
+
+	if (bpf_xdp_adjust_head(ctx, (int)sizeof(struct pppoe_hdr)))
+		return XDP_DROP;
+	data = (void *)(long)ctx->data;
+	data_end = (void *)(long)ctx->data_end;
+	if (data + l2_len > data_end)
+		return XDP_DROP;
+	__builtin_memcpy(data, l2, l2_len);
+	*(__be16 *)(data + l2_len - 2) = bpf_htons(ethertype);
+	return XDP_PASS;
+}
+
+/* Checks, counts and forwards an IPv6 packet of a subscriber (PPPoE or
+ * IPoE) whose header is at ip_off. Returns XDP_REDIRECT or XDP_DROP,
+ * XDP_PASS for control traffic to userspace (unchanged), or -1 when the
+ * kernel must forward it. */
+static __always_inline int subscriber_upstream6(struct xdp_md *ctx, const __u32 ip_off,
+                                                __be32 client_ip, __u32 fib_ifindex)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ipv6hdr *ip6 = data + ip_off;
+	if ((void *)(ip6 + 1) > data_end)
+		return XDP_DROP;
+	if (ip6->version != 6)
+		return XDP_DROP;
+	if (ipv6_is_control(ip6)) {
+		stat_inc(PPPOE_STAT_UP6_CONTROL);
+		return XDP_PASS;
+	}
+	__be32 *owner = sub6_owner(&ip6->saddr);
+	if (!owner || *owner != client_ip) {
+		stat_inc(PPPOE_STAT_UP6_SPOOFED);
+		return XDP_DROP;
+	}
+	if (!session_account(client_ip, 1, bpf_ntohs(ip6->payload_len) + sizeof(struct ipv6hdr))) {
+		stat_inc(PPPOE_STAT_UP_POLICED);
+		return XDP_DROP;
+	}
+	int ret = subscriber_forward6(ctx, ip_off, fib_ifindex);
+	if (ret == XDP_REDIRECT)
+		stat_inc(PPPOE_STAT_UP6_REDIRECT);
+	return ret;
+}
+
+/* ========================================================================
  * Upstream (access port, tail-called from dhcp_fastpath_prog)
  * ======================================================================== */
 
@@ -823,7 +1097,7 @@ static __always_inline int handle_upstream(struct xdp_md *ctx, const __u32 l2_le
 		return XDP_PASS;
 	if (ph->ver_type != 0x11 || ph->code != 0)
 		return XDP_PASS;
-	if (ph->ppp_proto != bpf_htons(PPP_IP)) {
+	if (ph->ppp_proto != bpf_htons(PPP_IP) && ph->ppp_proto != bpf_htons(PPP_IPV6)) {
 		stat_inc(PPPOE_STAT_UP_CONTROL);
 		return XDP_PASS;
 	}
@@ -840,6 +1114,15 @@ static __always_inline int handle_upstream(struct xdp_md *ctx, const __u32 l2_le
 		return XDP_PASS;
 	}
 
+	if (ph->ppp_proto == bpf_htons(PPP_IPV6)) {
+		int ret = subscriber_upstream6(ctx, l2_len + sizeof(struct pppoe_hdr),
+		                               sess->client_ip, sess->fib_ifindex);
+		if (ret >= 0)
+			return ret;
+		stat_inc(PPPOE_STAT_UP6_KERNEL);
+		return pppoe_to_kernel(ctx, l2_len, ETH_P_IPV6);
+	}
+
 	struct iphdr *ip = (void *)(ph + 1);
 	if ((void *)(ip + 1) > data_end)
 		return XDP_DROP;
@@ -853,76 +1136,14 @@ static __always_inline int handle_upstream(struct xdp_md *ctx, const __u32 l2_le
 		return XDP_DROP;
 	}
 
-	/* CGNAT. Packets about to expire go to the kernel untranslated, for
-	 * the ICMP Time Exceeded to reach the subscriber. */
-	if (ip->ttl > 1) {
-		struct nat_sub *ns = bpf_map_lookup_elem(&nat_subs, &sess->client_ip);
-		if (ns) {
-			if (nat_upstream(ctx, l2_len + sizeof(struct pppoe_hdr), ns))
-				return XDP_DROP;
-			data = (void *)(long)ctx->data;
-			data_end = (void *)(long)ctx->data_end;
-			eth = data;
-			ip = data + l2_len + sizeof(struct pppoe_hdr);
-			if ((void *)(ip + 1) > data_end)
-				return XDP_DROP;
-		}
-	}
-
-	/* Fast forwarding: route lookup in the kernel FIB */
-	struct bpf_fib_lookup fib = {};
-	int redirect = 0;
-	if (ip->ttl > 1) {
-		fib.family = AF_INET;
-		fib.tos = ip->tos;
-		fib.l4_protocol = ip->protocol;
-		fib.tot_len = bpf_ntohs(ip->tot_len);
-		fib.ipv4_src = ip->saddr;
-		fib.ipv4_dst = ip->daddr;
-		fib.ifindex = sess->fib_ifindex;
-
-		if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) == BPF_FIB_LKUP_RET_SUCCESS &&
-		    bpf_map_lookup_elem(&pppoe_tx_ports, &fib.ifindex))
-			redirect = 1;
-	}
-
-	if (redirect) {
-		ip_decrease_ttl(ip);
-
-		/* Drop L2 + PPPoE and write a fresh Ethernet header for the uplink */
-		if (bpf_xdp_adjust_head(ctx, (int)(l2_len + sizeof(struct pppoe_hdr) - sizeof(struct ethhdr))))
-			return XDP_DROP;
-		data = (void *)(long)ctx->data;
-		data_end = (void *)(long)ctx->data_end;
-		eth = data;
-		if ((void *)(eth + 1) > data_end)
-			return XDP_DROP;
-		__builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
-		__builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
-		eth->h_proto = bpf_htons(ETH_P_IP);
-
+	int ret = subscriber_forward(ctx, l2_len + sizeof(struct pppoe_hdr), sess->client_ip, sess->fib_ifindex);
+	if (ret == XDP_REDIRECT)
 		stat_inc(PPPOE_STAT_UP_REDIRECT);
-		return bpf_redirect(fib.ifindex, 0);
-	}
-
-	/* Kernel path: keep Ethernet (+ VLAN) header, drop PPPoE/PPP */
-	__u8 l2[sizeof(struct ethhdr) + sizeof(struct vlan_hdr)];
-	if ((void *)eth + l2_len > data_end)
-		return XDP_PASS;
-	__builtin_memcpy(l2, eth, l2_len);
-
-	if (bpf_xdp_adjust_head(ctx, (int)sizeof(struct pppoe_hdr)))
-		return XDP_DROP;
-	data = (void *)(long)ctx->data;
-	data_end = (void *)(long)ctx->data_end;
-	if (data + l2_len > data_end)
-		return XDP_DROP;
-	__builtin_memcpy(data, l2, l2_len);
-	/* The EtherType just before the IP header becomes IPv4 */
-	*(__be16 *)(data + l2_len - 2) = bpf_htons(ETH_P_IP);
+	if (ret >= 0)
+		return ret;
 
 	stat_inc(PPPOE_STAT_UP_KERNEL);
-	return XDP_PASS;
+	return pppoe_to_kernel(ctx, l2_len, ETH_P_IP);
 }
 
 SEC("xdp")
@@ -951,6 +1172,113 @@ int pppoe_upstream(struct xdp_md *ctx)
 }
 
 /* ========================================================================
+ * IPoE upstream (access port, tail-called from dhcp_fastpath_prog)
+ * ======================================================================== */
+
+static __always_inline int handle_ipoe_upstream(struct xdp_md *ctx, const __u32 l2_len, __u16 vlan_id)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+	struct iphdr *ip = data + l2_len;
+	if ((void *)(ip + 1) > data_end)
+		return XDP_PASS;
+
+	struct ipoe_up_key key = { .vlan_id = vlan_id };
+	__builtin_memcpy(key.client_mac, eth->h_source, ETH_ALEN);
+	struct pppoe_up_val *sess = bpf_map_lookup_elem(&ipoe_up, &key);
+	if (!sess) {
+		/* No lease (yet, or any more): the kernel must not route this
+		 * host to the internet, untranslated */
+		if (dp_flag(DP_F_IPOE_LEASE_ONLY) && !nat_bypassed(ip->daddr)) {
+			stat_inc(PPPOE_STAT_IPOE_UP_UNLEASED);
+			return XDP_DROP;
+		}
+		stat_inc(PPPOE_STAT_IPOE_UP_NO_SESSION);
+		return XDP_PASS;
+	}
+	if (ip->version != 4 || ip->saddr != sess->client_ip) {
+		stat_inc(PPPOE_STAT_IPOE_UP_SPOOFED);
+		return XDP_DROP;
+	}
+	if (!session_account(sess->client_ip, 1, bpf_ntohs(ip->tot_len))) {
+		stat_inc(PPPOE_STAT_UP_POLICED);
+		return XDP_DROP;
+	}
+
+	int ret = subscriber_forward(ctx, l2_len, sess->client_ip, sess->fib_ifindex);
+	if (ret == XDP_REDIRECT)
+		stat_inc(PPPOE_STAT_IPOE_UP_REDIRECT);
+	if (ret >= 0)
+		return ret;
+	/* The frame is plain (tagged) IPv4 already: the kernel routes it from
+	 * the VLAN subinterface */
+	stat_inc(PPPOE_STAT_IPOE_UP_KERNEL);
+	return XDP_PASS;
+}
+
+static __always_inline int handle_ipoe_upstream6(struct xdp_md *ctx, const __u32 l2_len, __u16 vlan_id)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+	struct ipv6hdr *ip6 = data + l2_len;
+	if ((void *)(ip6 + 1) > data_end)
+		return XDP_PASS;
+	if (ipv6_is_control(ip6)) {
+		stat_inc(PPPOE_STAT_UP6_CONTROL);
+		return XDP_PASS;
+	}
+
+	struct ipoe_up_key key = { .vlan_id = vlan_id };
+	__builtin_memcpy(key.client_mac, eth->h_source, ETH_ALEN);
+	struct pppoe_up_val *sess = bpf_map_lookup_elem(&ipoe_up, &key);
+	if (!sess) {
+		if (dp_flag(DP_F_IPOE_LEASE_ONLY)) {
+			stat_inc(PPPOE_STAT_IPOE_UP_UNLEASED);
+			return XDP_DROP;
+		}
+		stat_inc(PPPOE_STAT_IPOE_UP_NO_SESSION);
+		return XDP_PASS;
+	}
+
+	int ret = subscriber_upstream6(ctx, l2_len, sess->client_ip, sess->fib_ifindex);
+	if (ret >= 0)
+		return ret;
+	stat_inc(PPPOE_STAT_UP6_KERNEL);
+	return XDP_PASS;
+}
+
+SEC("xdp")
+int ipoe_upstream(struct xdp_md *ctx)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+
+	if ((void *)(eth + 1) > data_end)
+		return XDP_PASS;
+
+	if (eth->h_proto == bpf_htons(ETH_P_IP))
+		return handle_ipoe_upstream(ctx, sizeof(struct ethhdr), 0);
+	if (eth->h_proto == bpf_htons(ETH_P_IPV6))
+		return handle_ipoe_upstream6(ctx, sizeof(struct ethhdr), 0);
+
+	if (eth->h_proto == bpf_htons(ETH_P_8021Q) || eth->h_proto == bpf_htons(ETH_P_8021AD)) {
+		struct vlan_hdr *vh = (void *)(eth + 1);
+		if ((void *)(vh + 1) > data_end)
+			return XDP_PASS;
+		__u16 vid = bpf_ntohs(vh->h_vlan_TCI) & VLAN_VID_MASK;
+		if (vh->h_vlan_encapsulated_proto == bpf_htons(ETH_P_IP))
+			return handle_ipoe_upstream(ctx, sizeof(struct ethhdr) + sizeof(struct vlan_hdr), vid);
+		if (vh->h_vlan_encapsulated_proto == bpf_htons(ETH_P_IPV6))
+			return handle_ipoe_upstream6(ctx, sizeof(struct ethhdr) + sizeof(struct vlan_hdr), vid);
+	}
+
+	return XDP_PASS;
+}
+
+/* ========================================================================
  * Downstream (uplink ports)
  * ======================================================================== */
 
@@ -958,7 +1286,7 @@ int pppoe_upstream(struct xdp_md *ctx)
  * grown in front of the existing Ethernet header (VLAN tag + PPPoE/PPP) is
  * constant too. */
 static __always_inline int handle_downstream(struct xdp_md *ctx, struct pppoe_down_val *sess,
-                                             __u16 ip_len, const int tagged)
+                                             __u16 ip_len, const int tagged, const __u16 ppp_proto)
 {
 	const int grow = (tagged ? sizeof(struct vlan_hdr) : 0) + sizeof(struct pppoe_hdr);
 
@@ -987,10 +1315,81 @@ static __always_inline int handle_downstream(struct xdp_md *ctx, struct pppoe_do
 	ph->code = 0;
 	ph->session_id = sess->session_id;
 	ph->length = bpf_htons(ip_len + 2);
-	ph->ppp_proto = bpf_htons(PPP_IP);
+	ph->ppp_proto = bpf_htons(ppp_proto);
 
-	stat_inc(PPPOE_STAT_DOWN_REDIRECT);
+	stat_inc(ppp_proto == PPP_IP ? PPPOE_STAT_DOWN_REDIRECT : PPPOE_STAT_DOWN6_REDIRECT);
 	return bpf_redirect(sess->tx_ifindex, 0);
+}
+
+/* IPoE: new Ethernet header (+ 802.1Q tag) towards the subscriber */
+static __always_inline int handle_ipoe_downstream(struct xdp_md *ctx, struct pppoe_down_val *sess,
+                                                  const int tagged, const __u16 ethertype)
+{
+	if (tagged && bpf_xdp_adjust_head(ctx, -(int)sizeof(struct vlan_hdr)))
+		return XDP_DROP;
+
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+	if ((void *)(eth + 1) + (tagged ? sizeof(struct vlan_hdr) : 0) > data_end)
+		return XDP_DROP;
+
+	__builtin_memcpy(eth->h_dest, sess->client_mac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, sess->server_mac, ETH_ALEN);
+	if (tagged) {
+		struct vlan_hdr *vh = (void *)(eth + 1);
+		eth->h_proto = bpf_htons(ETH_P_8021Q);
+		vh->h_vlan_TCI = bpf_htons(sess->vlan_id & VLAN_VID_MASK);
+		vh->h_vlan_encapsulated_proto = bpf_htons(ethertype);
+	} else {
+		eth->h_proto = bpf_htons(ethertype);
+	}
+
+	stat_inc(ethertype == ETH_P_IP ? PPPOE_STAT_IPOE_DOWN_REDIRECT : PPPOE_STAT_DOWN6_REDIRECT);
+	return bpf_redirect(sess->tx_ifindex, 0);
+}
+
+/* IPv6 to a subscriber prefix: encapsulated towards the subscriber */
+static __always_inline int handle_downstream6(struct xdp_md *ctx)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ipv6hdr *ip6 = data + sizeof(struct ethhdr);
+	if ((void *)(ip6 + 1) > data_end)
+		return XDP_PASS;
+
+	__be32 *owner = sub6_owner(&ip6->daddr);
+	if (!owner)
+		return XDP_PASS;
+	__be32 client_ip = *owner;
+	struct pppoe_down_val *sess = bpf_map_lookup_elem(&pppoe_down, &client_ip);
+	if (!sess)
+		return XDP_PASS;
+
+	/* Let the kernel answer with ICMPv6 Time Exceeded */
+	if (ip6->hop_limit <= 1) {
+		stat_inc(PPPOE_STAT_DOWN_KERNEL);
+		return XDP_PASS;
+	}
+	__u16 len = bpf_ntohs(ip6->payload_len) + sizeof(struct ipv6hdr);
+	if (len > sess->mru) {
+		stat_inc(PPPOE_STAT_DOWN6_TOO_BIG);
+		return XDP_DROP;
+	}
+	if (!session_account(client_ip, 0, len)) {
+		stat_inc(PPPOE_STAT_DOWN_POLICED);
+		return XDP_DROP;
+	}
+	ip6->hop_limit--;
+
+	if (sess->flags & DOWN_F_IPOE) {
+		if (sess->vlan_id)
+			return handle_ipoe_downstream(ctx, sess, 1, ETH_P_IPV6);
+		return handle_ipoe_downstream(ctx, sess, 0, ETH_P_IPV6);
+	}
+	if (sess->vlan_id)
+		return handle_downstream(ctx, sess, len, 1, PPP_IPV6);
+	return handle_downstream(ctx, sess, len, 0, PPP_IPV6);
 }
 
 SEC("xdp")
@@ -1002,6 +1401,8 @@ int pppoe_downstream(struct xdp_md *ctx)
 
 	if ((void *)(eth + 1) > data_end)
 		return XDP_PASS;
+	if (eth->h_proto == bpf_htons(ETH_P_IPV6))
+		return handle_downstream6(ctx);
 	if (eth->h_proto != bpf_htons(ETH_P_IP))
 		return XDP_PASS;
 
@@ -1047,9 +1448,14 @@ int pppoe_downstream(struct xdp_md *ctx)
 
 	ip_decrease_ttl(ip);
 
+	if (sess->flags & DOWN_F_IPOE) {
+		if (sess->vlan_id)
+			return handle_ipoe_downstream(ctx, sess, 1, ETH_P_IP);
+		return handle_ipoe_downstream(ctx, sess, 0, ETH_P_IP);
+	}
 	if (sess->vlan_id)
-		return handle_downstream(ctx, sess, ip_len, 1);
-	return handle_downstream(ctx, sess, ip_len, 0);
+		return handle_downstream(ctx, sess, ip_len, 1, PPP_IP);
+	return handle_downstream(ctx, sess, ip_len, 0, PPP_IP);
 }
 
 char _license[] SEC("license") = "GPL";

@@ -636,12 +636,14 @@ static __always_inline struct pool_assignment *lookup_subscriber(
 
 #define ETH_P_PPP_SES 0x8864
 
-/* Slot 0 holds pppoe_upstream (bpf/pppoe_dataplane.c) when the PPPoE data
- * plane is enabled; an XDP program on the access port can only be one
- * program, so PPPoE session frames are handed over by tail call. */
+/* Programs of the subscriber data plane (bpf/pppoe_dataplane.c), when it is
+ * enabled: an XDP program on the access port can only be one program, so
+ * subscriber traffic is handed over by tail call.
+ *   slot 0: pppoe_upstream, for PPPoE session frames
+ *   slot 1: ipoe_upstream, for IPv6 and IPv4 that is not a DHCP request */
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(max_entries, 1);
+	__uint(max_entries, 2);
 	__type(key, __u32);
 	__type(value, __u32);
 } pppoe_progs SEC(".maps");
@@ -665,6 +667,39 @@ static __always_inline int is_pppoe_session(struct xdp_md *ctx) {
 	return 0;
 }
 
+/* IPv6, or IPv4 that is not a DHCP request; untagged or with one VLAN tag */
+static __always_inline int is_ip_data(struct xdp_md *ctx) {
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+
+	if ((void *)(eth + 1) > data_end)
+		return 0;
+	__be16 proto = eth->h_proto;
+	void *l3 = eth + 1;
+	if (proto == bpf_htons(ETH_P_8021Q) || proto == bpf_htons(ETH_P_8021AD)) {
+		struct vlan_hdr *vhdr = l3;
+		if ((void *)(vhdr + 1) > data_end)
+			return 0;
+		proto = vhdr->h_vlan_encapsulated_proto;
+		l3 = vhdr + 1;
+	}
+	if (proto == bpf_htons(ETH_P_IPV6))
+		return 1;
+	if (proto != bpf_htons(ETH_P_IP))
+		return 0;
+
+	struct iphdr *ip = l3;
+	if ((void *)(ip + 1) > data_end)
+		return 0;
+	if (ip->protocol != IPPROTO_UDP)
+		return 1;
+	struct udphdr *udp = (void *)ip + ip->ihl * 4;
+	if ((void *)(udp + 1) > data_end)
+		return 1;
+	return udp->dest != bpf_htons(DHCP_SERVER_PORT);
+}
+
 /* ========================================================================
  * Main XDP Program
  * ======================================================================== */
@@ -677,6 +712,10 @@ int dhcp_fastpath_prog(struct xdp_md *ctx) {
 	 * loaded the tail call falls through and the kernel gets the frame */
 	if (is_pppoe_session(ctx)) {
 		bpf_tail_call(ctx, &pppoe_progs, 0);
+		return XDP_PASS;
+	}
+	if (is_ip_data(ctx)) {
+		bpf_tail_call(ctx, &pppoe_progs, 1);
 		return XDP_PASS;
 	}
 
@@ -822,6 +861,11 @@ int dhcp_fastpath_prog(struct xdp_md *ctx) {
 
 	/* Determine reply type */
 	__u8 reply_type = (msg_type == DHCP_DISCOVER) ? DHCP_OFFER : DHCP_ACK;
+
+	/* An ACK renews the lease; userspace reads the new expiry before it
+	 * would expire the lease */
+	if (reply_type == DHCP_ACK)
+		assignment->lease_expiry = now + pool->lease_time;
 
 	/* === Build DHCP Reply (no XDP_PASS from here on) === */
 

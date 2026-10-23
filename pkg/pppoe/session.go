@@ -95,6 +95,24 @@ type Session struct {
 	lastUpPackets   uint64
 	lastDownPackets uint64
 
+	// IPv6 (dual stack). The RADIUS prefixes override the pools; WANPrefix
+	// and PDPrefix are what the session uses once IPv6 is up.
+	FramedIPv6Prefix    *net.IPNet // Framed-IPv6-Prefix: WAN /64 for SLAAC
+	DelegatedIPv6Prefix *net.IPNet // Delegated-IPv6-Prefix
+	WANPrefix           *net.IPNet
+	PDPrefix            *net.IPNet
+
+	// IPv6CP and IPv6 state, only touched by the server goroutine
+	ipv6cpStarted    bool
+	ipv6cpLocalAcked bool // Peer acked our Configure-Request
+	ipv6cpPeerAcked  bool // We acked the peer's Configure-Request
+	ipv6cpSentAt     time.Time
+	ipv6cpRetries    int
+	localIfID        uint64 // Our interface identifier (link-local fe80::localIfID)
+	peerIfID         uint64
+	ipv6Up           bool // Prefixes assigned and in the data plane
+	nextRA           time.Time
+
 	// IP configuration
 	ClientIP     net.IP
 	ServerIP     net.IP

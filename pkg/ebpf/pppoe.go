@@ -37,7 +37,16 @@ type pppoeDownVal struct {
 	VLANID    uint16
 	TXIfindex uint32
 	MRU       uint16
-	_         uint16
+	Flags     uint16 // downFlag*
+}
+
+// downFlagIPoE mirrors DOWN_F_IPOE
+const downFlagIPoE = 0x0001
+
+// ipoeUpKey mirrors struct ipoe_up_key
+type ipoeUpKey struct {
+	ClientMAC [6]byte
+	VLANID    uint16
 }
 
 // pppoePolicy mirrors struct pppoe_policy (rates in bytes per second)
@@ -84,6 +93,18 @@ var pppoeStatNames = []string{
 	"nat_unsupported",
 	"nat_frag_miss",
 	"nat_icmp_error",
+	"ipoe_up_redirect",
+	"ipoe_up_kernel",
+	"ipoe_up_no_session",
+	"ipoe_up_spoofed",
+	"ipoe_down_redirect",
+	"ipoe_up_unleased",
+	"up6_redirect",
+	"up6_kernel",
+	"up6_control",
+	"up6_spoofed",
+	"down6_redirect",
+	"down6_too_big",
 }
 
 // PPPoESession describes an established PPPoE session for the data plane
@@ -95,6 +116,19 @@ type PPPoESession struct {
 	VLANID      uint16 // Outer VLAN on the access port (0 = untagged)
 	MRU         uint16 // Peer MRU: largest IP packet sent to the client
 	FIBIfindex  int    // L3 interface of the session (e.g. the VLAN subinterface)
+	TXIfindex   int    // Access port the XDP fast path runs on
+	UpRateBPS   uint64 // Upload limit in bits/s (0 = unlimited)
+	DownRateBPS uint64 // Download limit in bits/s (0 = unlimited)
+}
+
+// IPoESession describes a leased IPoE subscriber for the data plane
+type IPoESession struct {
+	ClientMAC   net.HardwareAddr
+	ServerMAC   net.HardwareAddr // BNG MAC on the access VLAN (the clients' gateway)
+	ClientIP    net.IP
+	VLANID      uint16 // Outer VLAN on the access port (0 = untagged)
+	MTU         uint16 // Largest IP packet sent to the client
+	FIBIfindex  int    // L3 interface of the subscriber (e.g. the VLAN subinterface)
 	TXIfindex   int    // Access port the XDP fast path runs on
 	UpRateBPS   uint64 // Upload limit in bits/s (0 = unlimited)
 	DownRateBPS uint64 // Download limit in bits/s (0 = unlimited)
@@ -120,6 +154,10 @@ type PPPoEDataplane struct {
 	stats        *ebpf.Map
 	policies     *ebpf.Map
 	sessionStats *ebpf.Map
+	ipoeUp       *ebpf.Map
+	natBypass    *ebpf.Map
+	flags        *ebpf.Map
+	sub6         *ebpf.Map
 	links        []link.Link
 	nat          pppoeNATMaps
 }
@@ -166,6 +204,10 @@ func NewPPPoEDataplane(bpfPath string, opts PPPoEDataplaneOptions, logger *zap.L
 		stats:        coll.Maps["pppoe_stats"],
 		policies:     coll.Maps["pppoe_policy"],
 		sessionStats: coll.Maps["pppoe_sess_stats"],
+		ipoeUp:       coll.Maps["ipoe_up"],
+		natBypass:    coll.Maps["nat_bypass"],
+		flags:        coll.Maps["dp_flags"],
+		sub6:         coll.Maps["sub6"],
 		nat: pppoeNATMaps{
 			subs:    coll.Maps["nat_subs"],
 			out:     coll.Maps["nat_out"],
@@ -174,9 +216,10 @@ func NewPPPoEDataplane(bpfPath string, opts PPPoEDataplaneOptions, logger *zap.L
 		},
 	}
 	if d.sessionsUp == nil || d.sessionsDn == nil || d.txPorts == nil || d.stats == nil ||
-		d.policies == nil || d.sessionStats == nil ||
+		d.policies == nil || d.sessionStats == nil || d.ipoeUp == nil || d.natBypass == nil || d.flags == nil || d.sub6 == nil ||
 		d.nat.subs == nil || d.nat.out == nil || d.nat.in == nil || d.nat.poolIPs == nil ||
-		coll.Programs["pppoe_upstream"] == nil || coll.Programs["pppoe_downstream"] == nil {
+		coll.Programs["pppoe_upstream"] == nil || coll.Programs["pppoe_downstream"] == nil ||
+		coll.Programs["ipoe_upstream"] == nil {
 		coll.Close()
 		return nil, fmt.Errorf("%s is missing PPPoE programs or maps", path)
 	}
@@ -186,6 +229,12 @@ func NewPPPoEDataplane(bpfPath string, opts PPPoEDataplaneOptions, logger *zap.L
 // UpstreamProgram returns the access-side program for Loader.SetPPPoEProgram
 func (d *PPPoEDataplane) UpstreamProgram() *ebpf.Program {
 	return d.collection.Programs["pppoe_upstream"]
+}
+
+// IPoEUpstreamProgram returns the access-side IPoE program for
+// Loader.SetIPoEProgram
+func (d *PPPoEDataplane) IPoEUpstreamProgram() *ebpf.Program {
+	return d.collection.Programs["ipoe_upstream"]
 }
 
 // AttachUplink attaches the downstream program to an uplink port.
@@ -276,6 +325,140 @@ func (d *PPPoEDataplane) RemoveSession(s PPPoESession) error {
 		if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("failed to remove session: %w", err)
 		}
+	}
+	return nil
+}
+
+// AddIPoESession installs (or updates) a leased IPoE subscriber in both
+// directions. Its counters start from zero.
+func (d *PPPoEDataplane) AddIPoESession(s IPoESession) error {
+	key, upVal, ip, downVal, err := ipoeEntries(s)
+	if err != nil {
+		return err
+	}
+	var zero pppoeSessStats
+	if err := d.sessionStats.Put(&ip, &zero); err != nil {
+		return fmt.Errorf("failed to add subscriber counters: %w", err)
+	}
+	if err := d.setPolicy(ip, s.UpRateBPS, s.DownRateBPS); err != nil {
+		return err
+	}
+	if err := d.ipoeUp.Put(&key, &upVal); err != nil {
+		return fmt.Errorf("failed to add IPoE upstream entry: %w", err)
+	}
+	if err := d.sessionsDn.Put(&ip, &downVal); err != nil {
+		d.ipoeUp.Delete(&key)
+		return fmt.Errorf("failed to add IPoE downstream entry: %w", err)
+	}
+	return nil
+}
+
+// RemoveIPoESession removes an IPoE subscriber; entries already gone are
+// not an error
+func (d *PPPoEDataplane) RemoveIPoESession(s IPoESession) error {
+	key, _, ip, _, err := ipoeEntries(s)
+	if err != nil {
+		return err
+	}
+	errs := []error{
+		d.ipoeUp.Delete(&key),
+		d.sessionsDn.Delete(&ip),
+		d.policies.Delete(&ip),
+		d.sessionStats.Delete(&ip),
+	}
+	for _, err := range errs {
+		if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("failed to remove IPoE subscriber: %w", err)
+		}
+	}
+	return nil
+}
+
+// sub6Key mirrors struct sub6_key
+type sub6Key struct {
+	PrefixLen uint32
+	Addr      [16]byte
+}
+
+func newSub6Key(prefix *net.IPNet) (sub6Key, error) {
+	var k sub6Key
+	ip := prefix.IP.To16()
+	ones, bits := prefix.Mask.Size()
+	if ip == nil || prefix.IP.To4() != nil || bits != 128 {
+		return k, fmt.Errorf("%v is not an IPv6 prefix", prefix)
+	}
+	k.PrefixLen = uint32(ones)
+	copy(k.Addr[:], ip.Mask(prefix.Mask))
+	return k, nil
+}
+
+// AddSubscriberPrefix routes an IPv6 prefix (WAN /64 or delegated prefix)
+// to the subscriber with IPv4 address clientIP, whose session (PPPoE or
+// IPoE) must be in the data plane. Its source addresses are accepted
+// upstream from then on.
+func (d *PPPoEDataplane) AddSubscriberPrefix(clientIP net.IP, prefix *net.IPNet) error {
+	ip, err := pppoeIPKey(clientIP)
+	if err != nil {
+		return err
+	}
+	k, err := newSub6Key(prefix)
+	if err != nil {
+		return err
+	}
+	if err := d.sub6.Put(&k, &ip); err != nil {
+		return fmt.Errorf("failed to add subscriber prefix %v: %w", prefix, err)
+	}
+	return nil
+}
+
+// RemoveSubscriberPrefix removes a subscriber's IPv6 prefix; one already
+// gone is not an error
+func (d *PPPoEDataplane) RemoveSubscriberPrefix(prefix *net.IPNet) error {
+	k, err := newSub6Key(prefix)
+	if err != nil {
+		return err
+	}
+	if err := d.sub6.Delete(&k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("failed to remove subscriber prefix %v: %w", prefix, err)
+	}
+	return nil
+}
+
+// dpFlagIPoELeaseOnly mirrors DP_F_IPOE_LEASE_ONLY
+const dpFlagIPoELeaseOnly = 0x0001
+
+// SetIPoELeaseOnly makes IPv4 from access hosts without a lease (no
+// AddIPoESession) reach only NAT bypass destinations, instead of being
+// handed to the kernel to route anywhere
+func (d *PPPoEDataplane) SetIPoELeaseOnly(on bool) error {
+	var key, v uint32
+	if err := d.flags.Lookup(&key, &v); err != nil {
+		return err
+	}
+	if on {
+		v |= dpFlagIPoELeaseOnly
+	} else {
+		v &^= dpFlagIPoELeaseOnly
+	}
+	return d.flags.Put(&key, &v)
+}
+
+// AddNATBypass adds a destination prefix that subscribers reach without
+// CGNAT (their own pools, the BNG's addresses, internal services)
+func (d *PPPoEDataplane) AddNATBypass(prefix *net.IPNet) error {
+	ip4 := prefix.IP.To4()
+	ones, bits := prefix.Mask.Size()
+	if ip4 == nil || bits != 32 {
+		return fmt.Errorf("NAT bypass prefix %v is not IPv4", prefix)
+	}
+	key := struct {
+		PrefixLen uint32
+		Addr      [4]byte
+	}{PrefixLen: uint32(ones)}
+	copy(key.Addr[:], ip4.Mask(prefix.Mask))
+	var one uint8 = 1
+	if err := d.natBypass.Put(&key, &one); err != nil {
+		return fmt.Errorf("failed to add NAT bypass %v: %w", prefix, err)
 	}
 	return nil
 }
@@ -385,6 +568,38 @@ func (d *PPPoEDataplane) Close() error {
 	d.links = nil
 	d.collection.Close()
 	return errors.Join(errs...)
+}
+
+// ipoeEntries builds the map entries for an IPoE subscriber
+func ipoeEntries(s IPoESession) (ipoeUpKey, pppoeUpVal, [4]byte, pppoeDownVal, error) {
+	var key ipoeUpKey
+	var upVal pppoeUpVal
+	var ip [4]byte
+	var downVal pppoeDownVal
+
+	ip4 := s.ClientIP.To4()
+	if ip4 == nil {
+		return key, upVal, ip, downVal, fmt.Errorf("IPoE client IP %v is not IPv4", s.ClientIP)
+	}
+	if len(s.ClientMAC) != 6 || len(s.ServerMAC) != 6 {
+		return key, upVal, ip, downVal, fmt.Errorf("IPoE subscriber %v: invalid MAC address", s.ClientIP)
+	}
+	copy(ip[:], ip4)
+
+	copy(key.ClientMAC[:], s.ClientMAC)
+	key.VLANID = s.VLANID
+
+	upVal.ClientIP = ip
+	upVal.FIBIfindex = uint32(s.FIBIfindex)
+
+	copy(downVal.ClientMAC[:], s.ClientMAC)
+	copy(downVal.ServerMAC[:], s.ServerMAC)
+	downVal.VLANID = s.VLANID
+	downVal.TXIfindex = uint32(s.TXIfindex)
+	downVal.MRU = s.MTU
+	downVal.Flags = downFlagIPoE
+
+	return key, upVal, ip, downVal, nil
 }
 
 // pppoeEntries builds the map entries for a session

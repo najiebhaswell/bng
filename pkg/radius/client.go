@@ -15,6 +15,8 @@ import (
 	"layeh.com/radius/rfc2865"
 	"layeh.com/radius/rfc2866"
 	"layeh.com/radius/rfc2869"
+	"layeh.com/radius/rfc3162"
+	"layeh.com/radius/rfc4818"
 )
 
 // Client is a RADIUS client for AAA operations
@@ -85,26 +87,33 @@ type AuthResponse struct {
 	UploadBPS      uint64 // Upload rate limit (bits/sec)
 	// Acct-Interim-Interval in seconds (0 = not sent)
 	AcctInterimInterval uint32
+	// IPv6: Framed-IPv6-Prefix (RFC 3162, the WAN prefix) and
+	// Delegated-IPv6-Prefix (RFC 4818); nil = not sent
+	FramedIPv6Prefix    *net.IPNet
+	DelegatedIPv6Prefix *net.IPNet
 	Attributes          map[string]interface{}
 }
 
 // AcctRequest holds accounting request parameters
 type AcctRequest struct {
-	SessionID      string
-	Username       string
-	MAC            net.HardwareAddr
-	FramedIP       net.IP
-	StatusType     AcctStatusType
-	InputOctets    uint64
-	OutputOctets   uint64
-	InputPackets   uint64
-	OutputPackets  uint64
-	SessionTime    uint32
-	TerminateCause uint32
-	Class          []byte
-	NASPort        uint32
-	CircuitID      string
-	RemoteID       string
+	SessionID string
+	Username  string
+	MAC       net.HardwareAddr
+	FramedIP  net.IP
+	// IPv6 prefixes of the session (RFC 3162, RFC 4818); nil = none
+	FramedIPv6Prefix    *net.IPNet
+	DelegatedIPv6Prefix *net.IPNet
+	StatusType          AcctStatusType
+	InputOctets         uint64
+	OutputOctets        uint64
+	InputPackets        uint64
+	OutputPackets       uint64
+	SessionTime         uint32
+	TerminateCause      uint32
+	Class               []byte
+	NASPort             uint32
+	CircuitID           string
+	RemoteID            string
 }
 
 // AcctStatusType represents RADIUS accounting status types
@@ -293,6 +302,12 @@ func (c *Client) SendAccounting(ctx context.Context, req *AcctRequest) error {
 	if req.FramedIP != nil {
 		rfc2865.FramedIPAddress_Set(packet, req.FramedIP)
 	}
+	if req.FramedIPv6Prefix != nil {
+		rfc3162.FramedIPv6Prefix_Set(packet, req.FramedIPv6Prefix)
+	}
+	if req.DelegatedIPv6Prefix != nil {
+		rfc4818.DelegatedIPv6Prefix_Set(packet, req.DelegatedIPv6Prefix)
+	}
 
 	// Class attribute (from auth response)
 	if req.Class != nil {
@@ -361,6 +376,12 @@ func (c *Client) parseAuthAttributes(response *radius.Packet, authResp *AuthResp
 	}
 
 	// Framed-IP-Address
+	if p, err := rfc3162.FramedIPv6Prefix_Lookup(response); err == nil {
+		authResp.FramedIPv6Prefix = p
+	}
+	if p, err := rfc4818.DelegatedIPv6Prefix_Lookup(response); err == nil {
+		authResp.DelegatedIPv6Prefix = p
+	}
 	if ip, err := rfc2865.FramedIPAddress_Lookup(response); err == nil {
 		authResp.FramedIP = ip
 	}

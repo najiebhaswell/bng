@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	"github.com/codelaboratoryltd/bng/pkg/resilience"
 	"github.com/codelaboratoryltd/bng/pkg/routing"
 	"github.com/codelaboratoryltd/bng/pkg/slaac"
+	"github.com/codelaboratoryltd/bng/pkg/sub6"
 	"github.com/codelaboratoryltd/bng/pkg/walledgarden"
 	"github.com/spf13/cobra"
 	"github.com/vishvananda/netlink"
@@ -71,10 +73,14 @@ var (
 	xdpIface    string
 	serverIP    string
 	metricsAddr string
-	poolNetwork string
-	poolGateway string
-	poolDNS     string
-	leaseTime   time.Duration
+
+	// Management API (bng sessions)
+	apiAddr      string
+	apiTokenFile string
+	poolNetwork  string
+	poolGateway  string
+	poolDNS      string
+	leaseTime    time.Duration
 
 	// RADIUS configuration
 	radiusServers     string
@@ -99,6 +105,14 @@ var (
 	natLogEnabled  bool
 	natLogPath     string
 	natMaxMappings int
+	natBypass      string // Destination prefixes reached without CGNAT
+	ipoeXDP        bool   // Forward DHCP (IPoE) subscribers in the XDP data plane
+
+	// Dual stack for subscribers (PPPoE and IPoE in the XDP data plane)
+	ipv6WANPool  string // Per-subscriber WAN /64 advertised for SLAAC
+	ipv6PDPool   string // Prefixes delegated with DHCPv6
+	ipv6PDLength int
+	ipv6DNS      string
 
 	// Advanced NAT44 configuration (Issue #67)
 	natInsideInterface  string // Inside interface for NAT (subscriber-facing)
@@ -216,6 +230,10 @@ func init() {
 		"Interface for the XDP fast path (default: --interface). Set to the physical port when --interface is a VLAN subinterface of it, so the fast path can run in native mode")
 	runCmd.Flags().StringVar(&serverIP, "server-ip", "",
 		"DHCP server IP address (defaults to interface IP)")
+	runCmd.Flags().StringVar(&apiAddr, "api-addr", "127.0.0.1:8090",
+		"Management API (sessions: list, kill, rate) listen address; empty disables it")
+	runCmd.Flags().StringVar(&apiTokenFile, "api-token-file", "",
+		"File with a bearer token the management API requires (recommended when --api-addr is not loopback)")
 	runCmd.Flags().StringVar(&metricsAddr, "metrics-addr", ":9090",
 		"Prometheus metrics listen address")
 	runCmd.Flags().StringVar(&poolNetwork, "pool-network", "10.0.1.0/24",
@@ -262,6 +280,18 @@ func init() {
 		"Public IP addresses or prefixes for NAT pool (comma-separated)")
 	runCmd.Flags().IntVar(&natPortsPerSub, "nat-ports-per-sub", 1024,
 		"Number of ports allocated per subscriber")
+	runCmd.Flags().StringVar(&natBypass, "nat-bypass-prefixes", "",
+		"Destination prefixes subscribers reach without CGNAT, besides --pool-network and the server IP (comma-separated)")
+	runCmd.Flags().StringVar(&ipv6WANPool, "ipv6-wan-pool", "",
+		"Dual stack: pool of per-subscriber WAN /64s, advertised in Router Advertisements for SLAAC (PPPoE and --ipoe-xdp subscribers)")
+	runCmd.Flags().StringVar(&ipv6PDPool, "ipv6-pd-pool", "",
+		"Dual stack: pool of prefixes delegated to subscribers with DHCPv6 IA_PD")
+	runCmd.Flags().IntVar(&ipv6PDLength, "ipv6-pd-length", 64,
+		"Length of the delegated prefixes (e.g. 64, 60, 56)")
+	runCmd.Flags().StringVar(&ipv6DNS, "ipv6-dns", "",
+		"IPv6 DNS servers for subscribers, in RAs (RDNSS) and DHCPv6 (comma-separated)")
+	runCmd.Flags().BoolVar(&ipoeXDP, "ipoe-xdp", false,
+		"Forward DHCP (IPoE) subscribers in the XDP data plane of --pppoe-xdp-uplinks, with CGNAT when --nat-enabled")
 	runCmd.Flags().IntVar(&natMaxMappings, "nat-max-mappings", 1<<20,
 		"CGNAT mapping table size of the PPPoE XDP data plane (two preallocated tables of about 80 bytes an entry)")
 	runCmd.Flags().BoolVar(&natLogEnabled, "nat-log-enabled", false,
@@ -417,7 +447,7 @@ func init() {
 	runCmd.Flags().Uint16Var(&pppoeMRU, "pppoe-mru", 1492,
 		"Maximum Receive Unit")
 	runCmd.Flags().StringVar(&pppoeXDPUplinks, "pppoe-xdp-uplinks", "",
-		"Uplink interfaces (comma-separated) for the PPPoE XDP data plane; when set, established PPPoE sessions are forwarded in XDP")
+		"Uplink interfaces (comma-separated) for the subscriber XDP data plane; when set, established PPPoE sessions (and DHCP subscribers with --ipoe-xdp) are forwarded in XDP")
 	runCmd.Flags().StringVar(&pppoeBPFPath, "pppoe-bpf-path", "bpf/pppoe_dataplane.bpf.o",
 		"Path to compiled PPPoE data plane eBPF program")
 
@@ -1113,6 +1143,125 @@ func runBNG(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Subscriber XDP data plane: PPPoE sessions and, with --ipoe-xdp, DHCP
+	// leases are forwarded between the access port and the uplinks in XDP,
+	// behind CGNAT when NAT is enabled
+	var subDP *ebpf.PPPoEDataplane
+	var cgnat *subscriberCGNAT
+	if pppoeXDPUplinks != "" && (pppoeEnabled || ipoeXDP) {
+		subDP, err = setupSubscriberDataplane(loader, fastPathIface, srvIP, logger)
+		if err != nil {
+			return fmt.Errorf("failed to set up the subscriber XDP data plane: %w", err)
+		}
+		defer func() {
+			if stats, err := subDP.Stats(); err == nil {
+				logger.Info("Subscriber XDP data plane statistics", zap.Any("stats", stats))
+			}
+			if err := loader.SetPPPoEProgram(nil); err != nil {
+				logger.Warn("Failed to remove PPPoE upstream program", zap.Error(err))
+			}
+			if err := loader.SetIPoEProgram(nil); err != nil {
+				logger.Warn("Failed to remove IPoE upstream program", zap.Error(err))
+			}
+			if err := subDP.Close(); err != nil {
+				logger.Warn("Failed to close the subscriber XDP data plane", zap.Error(err))
+			}
+		}()
+		if natEnabled {
+			cgnat, err = newSubscriberCGNAT(subDP, natLogger, logger)
+			if err != nil {
+				return fmt.Errorf("failed to set up CGNAT: %w", err)
+			}
+			go cgnat.sweepLoop(ctx)
+		}
+	}
+	// Dual stack: per-subscriber WAN /64 (SLAAC) and delegated prefix, from
+	// the pools unless RADIUS assigns them (Framed-IPv6-Prefix,
+	// Delegated-IPv6-Prefix)
+	var v6WAN, v6PD *sub6.PrefixPool
+	if ipv6WANPool != "" {
+		if v6WAN, err = sub6.NewPrefixPool(ipv6WANPool, 64); err != nil {
+			return fmt.Errorf("--ipv6-wan-pool: %w", err)
+		}
+	}
+	if ipv6PDPool != "" {
+		if v6PD, err = sub6.NewPrefixPool(ipv6PDPool, ipv6PDLength); err != nil {
+			return fmt.Errorf("--ipv6-pd-pool: %w", err)
+		}
+	}
+	dualStack := v6WAN != nil || v6PD != nil
+	if dualStack && subDP == nil {
+		return fmt.Errorf("--ipv6-wan-pool and --ipv6-pd-pool need the XDP data plane (--pppoe-xdp-uplinks)")
+	}
+	var v6Responder func(mtu uint32) *sub6.Responder
+	if dualStack {
+		var dns []net.IP
+		for _, d := range splitAndTrim(ipv6DNS) {
+			ip := net.ParseIP(d)
+			if ip == nil || ip.To4() != nil {
+				return fmt.Errorf("--ipv6-dns: invalid IPv6 address %q", d)
+			}
+			dns = append(dns, ip)
+		}
+		link, err := net.InterfaceByName(iface)
+		if err != nil {
+			return err
+		}
+		v6Responder = func(mtu uint32) *sub6.Responder {
+			return sub6.NewResponder(sub6.Config{
+				DNS:               dns,
+				ServerDUID:        sub6.DUIDFromMAC(link.HardwareAddr),
+				PreferredLifetime: dhcpv6PreferredLifetime,
+				ValidLifetime:     dhcpv6ValidLifetime,
+				MTU:               mtu,
+			})
+		}
+		logger.Info("Dual stack enabled for subscribers",
+			zap.String("wan_pool", ipv6WANPool),
+			zap.String("pd_pool", ipv6PDPool),
+			zap.Int("pd_length", ipv6PDLength),
+		)
+	}
+
+	var ipoe6Server *sub6.IPoEServer
+	if ipoeXDP {
+		if subDP == nil {
+			return fmt.Errorf("--ipoe-xdp needs --pppoe-xdp-uplinks")
+		}
+		ipoe, err := newIPoEXDPDataplane(subDP, iface, fastPathIface, fastPathVLAN, cgnat, policyMgr, logger)
+		if err != nil {
+			return fmt.Errorf("failed to set up IPoE forwarding: %w", err)
+		}
+		// No lease, no forwarding: hosts without one only reach the BNG
+		// and the subscriber pool
+		if err := subDP.SetIPoELeaseOnly(true); err != nil {
+			return fmt.Errorf("failed to configure IPoE forwarding: %w", err)
+		}
+		if err := loader.SetIPoEProgram(subDP.IPoEUpstreamProgram()); err != nil {
+			return fmt.Errorf("failed to install the IPoE upstream program: %w", err)
+		}
+		if dualStack {
+			ipoe6, err := sub6.NewIPoEServer(sub6.IPoEConfig{
+				Interface: iface,
+				Responder: v6Responder(uint32(ipoe.mtu)),
+				WANPool:   v6WAN,
+				PDPool:    v6PD,
+				Router:    subDP,
+			}, logger)
+			if err != nil {
+				return fmt.Errorf("failed to set up IPv6 for IPoE: %w", err)
+			}
+			go ipoe6.Run(ctx)
+			ipoe.v6 = ipoe6
+			ipoe6Server = ipoe6
+		}
+		dhcpServer.SetDataplane(ipoe)
+		logger.Info("IPoE subscribers forwarded in XDP",
+			zap.String("interface", iface),
+			zap.Bool("cgnat", cgnat != nil),
+		)
+	}
+
 	// Initialize PPPoE server if enabled
 	var pppoeServer *pppoe.Server
 	if pppoeEnabled {
@@ -1153,29 +1302,21 @@ func runBNG(cmd *cobra.Command, args []string) error {
 				pppoeServer.SetRADIUSClient(radiusClient)
 			}
 			pppoeServer.SetPolicyManager(policyMgr)
-			if pppoeXDPUplinks != "" {
-				dp, err := setupPPPoEDataplane(loader, pppoeIface, iface, fastPathIface, fastPathVLAN, logger)
+			if dualStack {
+				pppoeServer.SetIPv6(&pppoe.IPv6{
+					WANPool:   v6WAN,
+					PDPool:    v6PD,
+					Responder: v6Responder(uint32(pppoeMRU)),
+				})
+			}
+			if subDP != nil {
+				dp, err := newPPPoEXDPDataplane(subDP, pppoeIface, iface, fastPathIface, fastPathVLAN)
 				if err != nil {
-					return fmt.Errorf("failed to set up PPPoE XDP data plane: %w", err)
+					return fmt.Errorf("failed to set up PPPoE forwarding: %w", err)
 				}
-				defer func() {
-					if stats, err := dp.dp.Stats(); err == nil {
-						logger.Info("PPPoE XDP data plane statistics", zap.Any("stats", stats))
-					}
-					if err := loader.SetPPPoEProgram(nil); err != nil {
-						logger.Warn("Failed to remove PPPoE upstream program", zap.Error(err))
-					}
-					if err := dp.dp.Close(); err != nil {
-						logger.Warn("Failed to close PPPoE XDP data plane", zap.Error(err))
-					}
-				}()
-				if natEnabled {
-					cgnat, err := newPPPoECGNAT(dp.dp, natLogger, logger)
-					if err != nil {
-						return fmt.Errorf("failed to set up CGNAT: %w", err)
-					}
-					dp.nat = cgnat
-					go cgnat.sweepLoop(ctx)
+				dp.nat = cgnat
+				if err := loader.SetPPPoEProgram(subDP.UpstreamProgram()); err != nil {
+					return fmt.Errorf("failed to install the PPPoE upstream program: %w", err)
 				}
 				pppoeServer.SetDataplane(dp)
 			}
@@ -1297,6 +1438,41 @@ func runBNG(cmd *cobra.Command, args []string) error {
 	metricsCollector := metrics.New(loader, poolMgr, dhcpServer, logger)
 	if err := metricsCollector.Register(); err != nil {
 		logger.Warn("Failed to register metrics", zap.Error(err))
+	}
+
+	// Management API
+	if apiAddr != "" {
+		api := &mgmtAPI{
+			pppoe:    pppoeServer,
+			dhcp:     dhcpServer,
+			dp:       subDP,
+			nat:      cgnat,
+			ipoe6:    ipoe6Server,
+			policies: policyMgr,
+			vlan:     fastPathVLAN,
+			logger:   logger,
+		}
+		if apiTokenFile != "" {
+			tok, err := os.ReadFile(apiTokenFile)
+			if err != nil {
+				return fmt.Errorf("--api-token-file: %w", err)
+			}
+			if api.token = strings.TrimSpace(string(tok)); api.token == "" {
+				return fmt.Errorf("--api-token-file %s is empty", apiTokenFile)
+			}
+		}
+		apiServer := &http.Server{
+			Addr:              apiAddr,
+			Handler:           api.handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			logger.Info("Starting management API", zap.String("addr", apiAddr), zap.Bool("token", api.token != ""))
+			if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("Management API error", zap.Error(err))
+			}
+		}()
+		defer apiServer.Close()
 	}
 
 	// Start metrics HTTP server
@@ -1737,7 +1913,7 @@ type pppoeXDPDataplane struct {
 	vlan       uint16 // VLAN tag the XDP program sees on PPPoE frames
 	fibIfindex int    // PPPoE interface, used for route lookups
 	txIfindex  int    // Port the XDP fast path runs on
-	nat        *pppoeCGNAT
+	nat        *subscriberCGNAT
 }
 
 func (a *pppoeXDPDataplane) entry(s *pppoe.Session) ebpf.PPPoESession {
@@ -1761,6 +1937,29 @@ func (a *pppoeXDPDataplane) entry(s *pppoe.Session) ebpf.PPPoESession {
 	}
 }
 
+func (a *pppoeXDPDataplane) AddIPv6(s *pppoe.Session) error {
+	for _, p := range []*net.IPNet{s.WANPrefix, s.PDPrefix} {
+		if p == nil {
+			continue
+		}
+		if err := a.dp.AddSubscriberPrefix(s.ClientIP, p); err != nil {
+			a.RemoveIPv6(s)
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *pppoeXDPDataplane) RemoveIPv6(s *pppoe.Session) error {
+	var errs []error
+	for _, p := range []*net.IPNet{s.WANPrefix, s.PDPrefix} {
+		if p != nil {
+			errs = append(errs, a.dp.RemoveSubscriberPrefix(p))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (a *pppoeXDPDataplane) SetRate(s *pppoe.Session, upBPS, downBPS uint64) error {
 	return a.dp.SetSessionRate(s.ClientIP, upBPS, downBPS)
 }
@@ -1781,13 +1980,13 @@ func (a *pppoeXDPDataplane) Counters(s *pppoe.Session) (pppoe.Counters, error) {
 func (a *pppoeXDPDataplane) AddSession(s *pppoe.Session) error {
 	// The port block goes in first, so no packet leaves untranslated
 	if a.nat != nil {
-		if err := a.nat.add(s); err != nil {
+		if err := a.nat.add(s.ClientIP, s.Username); err != nil {
 			return err
 		}
 	}
 	if err := a.dp.AddSession(a.entry(s)); err != nil {
 		if a.nat != nil {
-			a.nat.remove(s)
+			a.nat.remove(s.ClientIP)
 		}
 		return err
 	}
@@ -1797,21 +1996,22 @@ func (a *pppoeXDPDataplane) AddSession(s *pppoe.Session) error {
 func (a *pppoeXDPDataplane) RemoveSession(s *pppoe.Session) error {
 	err := a.dp.RemoveSession(a.entry(s))
 	if a.nat != nil {
-		a.nat.remove(s)
+		a.nat.remove(s.ClientIP)
 	}
 	return err
 }
 
-// pppoeCGNAT gives PPPoE sessions with a private address a CGNAT port
-// block in the XDP data plane, logs the assignments and expires mappings
-type pppoeCGNAT struct {
+// subscriberCGNAT gives subscribers (PPPoE sessions, DHCP leases) with a
+// private address a CGNAT port block in the XDP data plane, logs the
+// assignments and expires mappings
+type subscriberCGNAT struct {
 	dp     *ebpf.PPPoEDataplane
 	blocks *nat.BlockAllocator
 	log    *nat.Logger // nil = no NAT logging
 	logger *zap.Logger
 }
 
-func newPPPoECGNAT(dp *ebpf.PPPoEDataplane, natLog *nat.Logger, logger *zap.Logger) (*pppoeCGNAT, error) {
+func newSubscriberCGNAT(dp *ebpf.PPPoEDataplane, natLog *nat.Logger, logger *zap.Logger) (*subscriberCGNAT, error) {
 	pub, err := nat.ParsePublicIPs(splitAndTrim(natPublicIPs))
 	if err != nil {
 		return nil, err
@@ -1826,21 +2026,23 @@ func newPPPoECGNAT(dp *ebpf.PPPoEDataplane, natLog *nat.Logger, logger *zap.Logg
 		}
 	}
 	_, total := blocks.Usage()
-	logger.Info("CGNAT enabled in the PPPoE XDP data plane",
+	logger.Info("CGNAT enabled in the subscriber XDP data plane",
 		zap.Int("public_ips", len(pub)),
 		zap.Uint16("ports_per_subscriber", blocks.BlockSize()),
 		zap.Int("port_blocks", total),
 		zap.Int("max_mappings", natMaxMappings),
 		zap.Bool("logging", natLog != nil),
 	)
-	return &pppoeCGNAT{dp: dp, blocks: blocks, log: natLog, logger: logger}, nil
+	return &subscriberCGNAT{dp: dp, blocks: blocks, log: natLog, logger: logger}, nil
 }
 
-func (n *pppoeCGNAT) add(s *pppoe.Session) error {
-	if !nat.IsPrivateIPv4(s.ClientIP) {
+// add gives a subscriber address a port block; who (login, MAC or
+// circuit-id) goes into the NAT log
+func (n *subscriberCGNAT) add(ip net.IP, who string) error {
+	if !nat.IsPrivateIPv4(ip) {
 		return nil
 	}
-	alloc, gen, err := n.blocks.Allocate(s.ClientIP, s.Username)
+	alloc, gen, err := n.blocks.Allocate(ip, who)
 	if err != nil {
 		return err
 	}
@@ -1850,16 +2052,16 @@ func (n *pppoeCGNAT) add(s *pppoe.Session) error {
 		PortCount: alloc.PortEnd - alloc.PortStart + 1,
 		Gen:       gen,
 	}
-	if err := n.dp.SetSubscriberNAT(s.ClientIP, block); err != nil {
-		n.blocks.Release(s.ClientIP)
+	if err := n.dp.SetSubscriberNAT(ip, block); err != nil {
+		n.blocks.Release(ip)
 		return err
 	}
 	if n.log != nil {
 		n.log.LogAllocation(alloc)
 	}
 	n.logger.Info("CGNAT port block assigned",
-		zap.String("username", s.Username),
-		zap.String("private_ip", s.ClientIP.String()),
+		zap.String("subscriber", who),
+		zap.String("private_ip", ip.String()),
 		zap.String("public_ip", alloc.PublicIP.String()),
 		zap.Uint16("port_start", alloc.PortStart),
 		zap.Uint16("port_end", alloc.PortEnd),
@@ -1867,12 +2069,12 @@ func (n *pppoeCGNAT) add(s *pppoe.Session) error {
 	return nil
 }
 
-func (n *pppoeCGNAT) remove(s *pppoe.Session) {
-	alloc := n.blocks.Release(s.ClientIP)
+func (n *subscriberCGNAT) remove(ip net.IP) {
+	alloc := n.blocks.Release(ip)
 	if alloc == nil {
 		return
 	}
-	if err := n.dp.DeleteSubscriberNAT(s.ClientIP); err != nil {
+	if err := n.dp.DeleteSubscriberNAT(ip); err != nil {
 		n.logger.Warn("Failed to remove CGNAT port block", zap.Error(err))
 	}
 	if n.log != nil {
@@ -1881,7 +2083,7 @@ func (n *pppoeCGNAT) remove(s *pppoe.Session) {
 }
 
 // sweepLoop removes idle and stale mappings
-func (n *pppoeCGNAT) sweepLoop(ctx context.Context) {
+func (n *subscriberCGNAT) sweepLoop(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -1909,28 +2111,16 @@ func (n *pppoeCGNAT) sweepLoop(ctx context.Context) {
 	}
 }
 
-// setupPPPoEDataplane loads the PPPoE XDP data plane, hooks its upstream
-// program into the DHCP fast path on the access port and attaches the
-// downstream program to the uplinks.
-func setupPPPoEDataplane(loader *ebpf.Loader, pppoeIface, dhcpIface, fastPathIface string,
-	fastPathVLAN uint16, logger *zap.Logger) (*pppoeXDPDataplane, error) {
-	// PPPoE frames must arrive where the XDP fast path runs
-	if pppoeIface != dhcpIface {
-		return nil, fmt.Errorf("--pppoe-interface %s must match --interface %s", pppoeIface, dhcpIface)
-	}
+// setupSubscriberDataplane loads the subscriber XDP data plane and
+// attaches its downstream program to the uplinks. The access-side programs
+// are installed into the DHCP fast path by their users (SetPPPoEProgram,
+// SetIPoEProgram).
+func setupSubscriberDataplane(loader *ebpf.Loader, fastPathIface string, serverIP net.IP,
+	logger *zap.Logger) (*ebpf.PPPoEDataplane, error) {
 	// XDP forwarding bypasses the TC hooks QoS relies on (NAT is done in
-	// the PPPoE data plane itself)
+	// the data plane itself)
 	if qosEnabled {
 		return nil, fmt.Errorf("cannot be combined with --qos-enabled")
-	}
-
-	pppoeLink, err := net.InterfaceByName(pppoeIface)
-	if err != nil {
-		return nil, err
-	}
-	accessLink, err := net.InterfaceByName(fastPathIface)
-	if err != nil {
-		return nil, err
 	}
 
 	dp, err := ebpf.NewPPPoEDataplane(pppoeBPFPath, ebpf.PPPoEDataplaneOptions{NATMappings: natMaxMappings}, logger)
@@ -1944,22 +2134,164 @@ func setupPPPoEDataplane(loader *ebpf.Loader, pppoeIface, dhcpIface, fastPathIfa
 			return nil, err
 		}
 	}
-	if err := loader.SetPPPoEProgram(dp.UpstreamProgram()); err != nil {
-		dp.Close()
-		return nil, err
+
+	// Subscribers reach their own pool (gateway, each other) and the BNG
+	// without translation
+	bypass := append([]string{poolNetwork, serverIP.String() + "/32"}, splitAndTrim(natBypass)...)
+	for _, p := range bypass {
+		if p == "" {
+			continue
+		}
+		_, prefix, err := net.ParseCIDR(p)
+		if err == nil {
+			err = dp.AddNATBypass(prefix)
+		}
+		if err != nil {
+			dp.Close()
+			return nil, fmt.Errorf("NAT bypass prefix %q: %w", p, err)
+		}
 	}
 
-	logger.Info("PPPoE XDP data plane enabled",
+	logger.Info("Subscriber XDP data plane enabled",
 		zap.String("access_interface", fastPathIface),
-		zap.Uint16("vlan", fastPathVLAN),
 		zap.String("uplinks", pppoeXDPUplinks),
+		zap.Strings("nat_bypass", bypass),
 	)
+	return dp, nil
+}
+
+// newPPPoEXDPDataplane forwards the PPPoE server's sessions in the
+// subscriber data plane
+func newPPPoEXDPDataplane(dp *ebpf.PPPoEDataplane, pppoeIface, dhcpIface, fastPathIface string,
+	fastPathVLAN uint16) (*pppoeXDPDataplane, error) {
+	// PPPoE frames must arrive where the XDP fast path runs
+	if pppoeIface != dhcpIface {
+		return nil, fmt.Errorf("--pppoe-interface %s must match --interface %s", pppoeIface, dhcpIface)
+	}
+	pppoeLink, err := net.InterfaceByName(pppoeIface)
+	if err != nil {
+		return nil, err
+	}
+	accessLink, err := net.InterfaceByName(fastPathIface)
+	if err != nil {
+		return nil, err
+	}
 	return &pppoeXDPDataplane{
 		dp:         dp,
 		vlan:       fastPathVLAN,
 		fibIfindex: pppoeLink.Index,
 		txIfindex:  accessLink.Index,
 	}, nil
+}
+
+// ipoeXDPDataplane adapts the subscriber data plane to dhcp.LeaseDataplane:
+// leased subscribers are forwarded in XDP, behind CGNAT if enabled, with
+// the rate of their QoS policy (Filter-Id)
+type ipoeXDPDataplane struct {
+	dp         *ebpf.PPPoEDataplane
+	vlan       uint16           // VLAN tag the XDP program sees on the subscribers' frames
+	serverMAC  net.HardwareAddr // the subscribers' gateway
+	mtu        uint16
+	fibIfindex int // DHCP interface, used for route lookups
+	txIfindex  int // Port the XDP fast path runs on
+	nat        *subscriberCGNAT
+	policies   *radius.PolicyManager
+	v6         *sub6.IPoEServer // nil = IPv4 only
+	logger     *zap.Logger
+}
+
+func newIPoEXDPDataplane(dp *ebpf.PPPoEDataplane, dhcpIface, fastPathIface string, fastPathVLAN uint16,
+	cgnat *subscriberCGNAT, policies *radius.PolicyManager, logger *zap.Logger) (*ipoeXDPDataplane, error) {
+	dhcpLink, err := net.InterfaceByName(dhcpIface)
+	if err != nil {
+		return nil, err
+	}
+	accessLink, err := net.InterfaceByName(fastPathIface)
+	if err != nil {
+		return nil, err
+	}
+	mtu := dhcpLink.MTU
+	if mtu <= 0 || mtu > 65535 {
+		mtu = 1500
+	}
+	return &ipoeXDPDataplane{
+		dp:         dp,
+		vlan:       fastPathVLAN,
+		serverMAC:  dhcpLink.HardwareAddr,
+		mtu:        uint16(mtu),
+		fibIfindex: dhcpLink.Index,
+		txIfindex:  accessLink.Index,
+		nat:        cgnat,
+		policies:   policies,
+		logger:     logger,
+	}, nil
+}
+
+func (a *ipoeXDPDataplane) entry(l *dhcp.Lease) ebpf.IPoESession {
+	s := ebpf.IPoESession{
+		ClientMAC:  l.MAC,
+		ServerMAC:  a.serverMAC,
+		ClientIP:   l.IP,
+		VLANID:     a.vlan,
+		MTU:        a.mtu,
+		FIBIfindex: a.fibIfindex,
+		TXIfindex:  a.txIfindex,
+	}
+	if l.PolicyName != "" && a.policies != nil {
+		if p := a.policies.GetPolicy(l.PolicyName); p != nil {
+			s.UpRateBPS, s.DownRateBPS = p.UploadBPS, p.DownloadBPS
+		}
+	}
+	return s
+}
+
+// ipoeSubscriber names a lease in the NAT log: its circuit-id if relayed,
+// else its MAC
+func ipoeSubscriber(l *dhcp.Lease) string {
+	if len(l.CircuitID) > 0 {
+		return "circuit-id:" + string(l.CircuitID)
+	}
+	return l.MAC.String()
+}
+
+func (a *ipoeXDPDataplane) AddLease(l *dhcp.Lease) error {
+	// The port block goes in first, so no packet leaves untranslated
+	if a.nat != nil {
+		if err := a.nat.add(l.IP, ipoeSubscriber(l)); err != nil {
+			return err
+		}
+	}
+	if err := a.dp.AddIPoESession(a.entry(l)); err != nil {
+		if a.nat != nil {
+			a.nat.remove(l.IP)
+		}
+		return err
+	}
+	// IPv6 failing leaves the subscriber IPv4-only
+	if a.v6 != nil {
+		if err := a.v6.Add(l.MAC, l.IP, l.FramedIPv6Prefix, l.DelegatedIPv6Prefix); err != nil {
+			a.logger.Warn("No IPv6 for IPoE subscriber",
+				zap.String("mac", l.MAC.String()),
+				zap.Error(err),
+			)
+		}
+	}
+	return nil
+}
+
+func (a *ipoeXDPDataplane) RemoveLease(l *dhcp.Lease) {
+	if a.v6 != nil {
+		a.v6.Remove(l.MAC)
+	}
+	if err := a.dp.RemoveIPoESession(a.entry(l)); err != nil {
+		a.logger.Warn("Failed to remove IPoE subscriber from the data plane",
+			zap.String("mac", l.MAC.String()),
+			zap.Error(err),
+		)
+	}
+	if a.nat != nil {
+		a.nat.remove(l.IP)
+	}
 }
 
 // parseBGPNeighborEntry parses a "ip:as" string into IP and AS number.

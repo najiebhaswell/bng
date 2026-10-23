@@ -93,7 +93,9 @@ struct pool_assignment {
 	                         * XDP program (0 = untagged); the fast path only
 	                         * answers requests arriving on this VLAN */
 	__u8  client_class;     /* Residential=1, Business=2, etc. */
-	__u64 lease_expiry;     /* Unix timestamp (seconds) */
+	__u64 lease_expiry;     /* CLOCK_MONOTONIC seconds (bpf_ktime_get_ns), as
+	                         * the fast path compares it; extended by the fast
+	                         * path on every ACK */
 	__u8  flags;            /* Static IP flag, etc. */
 	__u8  _pad[3];          /* Padding for alignment */
 } __attribute__((packed));

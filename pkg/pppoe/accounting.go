@@ -30,6 +30,8 @@ func (s *Server) applyAuthorization(session *Session, resp *radius.AuthResponse)
 	session.SessionLimit = time.Duration(resp.SessionTimeout) * time.Second
 	session.IdleLimit = time.Duration(resp.IdleTimeout) * time.Second
 	session.InterimInterval = time.Duration(resp.AcctInterimInterval) * time.Second
+	session.FramedIPv6Prefix = resp.FramedIPv6Prefix
+	session.DelegatedIPv6Prefix = resp.DelegatedIPv6Prefix
 	if up, down, ok := s.rateFor(resp.UploadBPS, resp.DownloadBPS, resp.FilterID); ok {
 		session.UpRateBPS, session.DownRateBPS = up, down
 	}
@@ -97,6 +99,9 @@ func (s *Server) sendAccounting(session *Session, status radius.AcctStatusType, 
 		TerminateCause: cause,
 		Class:          session.Class,
 		NASPort:        uint32(session.ID),
+
+		FramedIPv6Prefix:    session.WANPrefix,
+		DelegatedIPv6Prefix: session.PDPrefix,
 	}
 	if !session.EstablishedAt.IsZero() {
 		req.SessionTime = uint32(time.Since(session.EstablishedAt).Seconds())
@@ -139,6 +144,9 @@ func (s *Server) tickSessions(now time.Time) {
 	for _, session := range s.sessions.GetAllSessions() {
 		if !session.IsEstablished() {
 			continue
+		}
+		if session.ipv6Up && !now.Before(session.nextRA) {
+			s.sendRA(session)
 		}
 		if session.SessionLimit > 0 && now.Sub(session.limitsFrom) >= session.SessionLimit {
 			s.terminateSession(session, "session timeout", radius.TerminateCauseSessionTimeout)
@@ -255,13 +263,8 @@ func (s *Server) Disconnect(req *radius.DisconnectRequest) *radius.DisconnectRes
 			Message: "no session identification attribute"}
 	}
 
-	var n int
-	if !s.do(func() {
-		for _, session := range s.matchingSessions(sel) {
-			s.terminateSession(session, "RADIUS Disconnect-Request", radius.TerminateCauseAdminReset)
-			n++
-		}
-	}) {
+	n, ok := s.terminateMatching(sel, "RADIUS Disconnect-Request")
+	if !ok {
 		return &radius.DisconnectResponse{ErrorCause: radius.ErrorCauseResourcesUnavailable,
 			Message: "PPPoE server busy"}
 	}
@@ -271,6 +274,18 @@ func (s *Server) Disconnect(req *radius.DisconnectRequest) *radius.DisconnectRes
 	}
 	s.logger.Info("RADIUS Disconnect-Request handled", zap.Int("sessions", n))
 	return &radius.DisconnectResponse{Success: true}
+}
+
+// terminateMatching ends the established sessions a selector picks, with
+// Acct-Terminate-Cause Admin-Reset. ok is false if the server is busy.
+func (s *Server) terminateMatching(sel sessionSelector, reason string) (n int, ok bool) {
+	ok = s.do(func() {
+		for _, session := range s.matchingSessions(sel) {
+			s.terminateSession(session, reason, radius.TerminateCauseAdminReset)
+			n++
+		}
+	})
+	return n, ok
 }
 
 // ChangeAuthorization handles a RADIUS CoA-Request for the matching

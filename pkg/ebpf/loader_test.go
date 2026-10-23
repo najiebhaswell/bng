@@ -162,9 +162,9 @@ func TestMACRoundTrip(t *testing.T) {
 
 func TestLeaseExpiryFromDuration(t *testing.T) {
 	duration := 24 * time.Hour
-	before := uint64(time.Now().Unix())
+	before := MonotonicSeconds()
 	expiry := LeaseExpiryFromDuration(duration)
-	after := uint64(time.Now().Unix())
+	after := MonotonicSeconds()
 
 	expectedMin := before + uint64(duration.Seconds())
 	expectedMax := after + uint64(duration.Seconds())
@@ -899,9 +899,9 @@ func TestMACToUint64Empty(t *testing.T) {
 
 // Test LeaseExpiryFromDuration with zero duration
 func TestLeaseExpiryFromDurationZero(t *testing.T) {
-	before := uint64(time.Now().Unix())
+	before := MonotonicSeconds()
 	expiry := LeaseExpiryFromDuration(0)
-	after := uint64(time.Now().Unix())
+	after := MonotonicSeconds()
 
 	if expiry < before || expiry > after {
 		t.Errorf("LeaseExpiryFromDuration(0) = %d, expected between %d and %d",
@@ -911,7 +911,7 @@ func TestLeaseExpiryFromDurationZero(t *testing.T) {
 
 // Test LeaseExpiryFromDuration with negative duration
 func TestLeaseExpiryFromDurationNegative(t *testing.T) {
-	now := uint64(time.Now().Unix())
+	now := MonotonicSeconds()
 	expiry := LeaseExpiryFromDuration(-1 * time.Hour)
 
 	// Should be in the past
